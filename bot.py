@@ -211,6 +211,14 @@ if __name__ == "__main__":
             logger.info("🧹 Auto-cleaner hooked at startup")
         except Exception as ce:
             logger.warning(f"Cleaner startup hook failed (will auto-start on first msg): {ce}")
+        # Start the video stream server (/watch, /dl) for /stream links.
+        try:
+            from stream_server import start_stream_server
+            stream_port = Config.BIMBO_STREAM_PORT or (HEALTH_PORT + 1)
+            loop.create_task(start_stream_server(BIMBO_CLIENT, stream_port))
+            logger.info(f"🎬 Stream server hooked on port {stream_port}")
+        except Exception as se:
+            logger.warning(f"Stream server startup failed: {se}")
         # idle
         from pyrogram import idle
         idle()
