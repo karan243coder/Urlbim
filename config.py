@@ -148,6 +148,33 @@ class Config(object):
     # Gofile.io (no creds required, API key optional)
     GOFILE_TOKEN = _str("GOFILE_TOKEN", "")
 
+    # ==================================================================
+    # STREAM WEBSITE (video streaming via your own site)
+    # ==================================================================
+    # Tumhari website ka base URL. Bot yahan file bhej kar / register kar ke
+    # playable + download link banata hai. Trailing slash optional.
+    BIMBO_STREAM_SITE = _str("BIMBO_STREAM_SITE", "https://urlbotwebsite.vercel.app").rstrip("/")
+    # Website ke /api/stream endpoint ka path.
+    BIMBO_STREAM_API_PATH = _str("BIMBO_STREAM_API_PATH", "/api/stream")
+    # Website ke player page ka path. Bot short token isi ke aage lagata hai:
+    #   {SITE}{PLAYER_PATH}?t={token}
+    BIMBO_STREAM_PLAYER_PATH = _str("BIMBO_STREAM_PLAYER_PATH", "/watch")
+    # Optional shared secret — website API ko bhejta hai (agar tum website pe
+    # verify karna chaho to). Khali chhod sakte ho.
+    BIMBO_STREAM_API_KEY = _str("BIMBO_STREAM_API_KEY", "")
+    # Generated stream link kitne ghante baad auto-delete/expire ho (default 1 din)
+    BIMBO_STREAM_TTL_HOURS = _int("BIMBO_STREAM_TTL_HOURS", 24)
+    # Bot ke apne stream server ka PUBLIC url (Koyeb/VPS ka https domain).
+    # Yehi /watch aur /dl links serve karta hai. Website isi ko point karti hai.
+    # Khali chhod doge to website (BIMBO_STREAM_SITE) ka /watch use hoga.
+    BIMBO_STREAM_PUBLIC_URL = _str("BIMBO_STREAM_PUBLIC_URL", "").rstrip("/")
+    # Stream server ke liye alag port (0 => health port + 1). Koyeb pe single
+    # port hota hai, is case me health server ko bhi isi me merge kar sakte ho.
+    BIMBO_STREAM_PORT = _int("BIMBO_STREAM_PORT", 0)
+    # Videos ko store karne wala channel (private). Bot yahan copy karta hai
+    # taaki original delete hone par bhi stream chalti rahe. 0 => log channel use.
+    BIMBO_STREAM_CHANNEL = _int("BIMBO_STREAM_CHANNEL", 0)
+
     # Anti-Spam: rate limit per user (seconds between downloads for free users)
     RATE_LIMIT_SECONDS = _int("RATE_LIMIT_SECONDS", 15)
 
