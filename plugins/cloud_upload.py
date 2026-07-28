@@ -1,7 +1,8 @@
 # BIMBO v4.0 — Cloud Upload Plugin
-# /gofile  reply → upload to gofile.io & give stream link
 # /mega    reply → upload to Mega.nz (needs MEGA_EMAIL/PASSWORD)
 # /gdrive  reply → upload to Google Drive (needs service account json)
+# NOTE: /gofile and /stream ko yahan se hata diya gaya hai.
+#       /stream ab apni website (plugins/stream_link.py) se chalta hai.
 import os
 import time
 import asyncio
@@ -20,37 +21,6 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 
-# ----------------------- GOFILE (no creds required) -----------------------
-async def _gofile_upload(file_path: str):
-    """Upload file to gofile.io, returns direct URL or None."""
-    # Step 1: get best server
-    try:
-        timeout = aiohttp.ClientTimeout(total=600)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get("https://api.gofile.io/getServer", ssl=False) as r:
-                j = await r.json()
-            if j.get("status") != "ok":
-                return None, "gofile getServer failed"
-            srv = j["data"]["server"]
-            url = f"https://{srv}.gofile.io/uploadFile"
-            form = aiohttp.FormData()
-            form.add_field("file", open(file_path, "rb"),
-                           filename=os.path.basename(file_path))
-            headers = {}
-            if Config.GOFILE_TOKEN:
-                headers["Authorization"] = f"Bearer {Config.GOFILE_TOKEN}"
-            async with s.post(url, data=form, headers=headers, ssl=False) as r:
-                j = await r.json()
-            if j.get("status") != "ok":
-                return None, str(j)
-            d = j["data"]
-            return d.get("downloadPage"), d.get("code")
-    except Exception as e:
-        logger.exception("gofile")
-        return None, str(e)
-
-
-
 # ============== Cross-version safe command filter ==============
 def _cmd(*names):
     names = [n.lower().lstrip("/") for n in names]
@@ -65,45 +35,6 @@ def _cmd(*names):
         first = t.split()[0][1:].split("@")[0].lower()
         return first in names
     return filters.create(f)
-
-
-@Client.on_message(filters.private & _cmd('gofile', 'stream'))
-async def cmd_gofile(client, message):
-    if not message.reply_to_message or not is_media(message.reply_to_message):
-        return await message.reply_text("❌ Reply to a file/video to upload to Gofile.")
-    uid = message.from_user.id
-    work = user_download_dir(uid) + f"/gf_{int(time.time())}"
-    os.makedirs(work, exist_ok=True)
-    msg = await message.reply_text(Translation.PROCESSING)
-    try:
-        def _name(m):
-            for t in ("video", "document", "audio", "animation"):
-                x = getattr(m, t, None)
-                if x and getattr(x, "file_name", None):
-                    return x.file_name
-            return f"file_{int(time.time())}.bin"
-        fn = safe_filename(_name(message.reply_to_message))
-        path = os.path.join(work, fn)
-        await msg.edit_text("📥 Downloading from Telegram...")
-        path = await message.reply_to_message.download(file_name=path)
-        sz = os.path.getsize(path)
-        await msg.edit_text(f"☁️ Uploading {humanbytes(sz)} to Gofile...")
-        link, code = await _gofile_upload(path)
-        if not link:
-            return await msg.edit_text(f"❌ Upload failed: <code>{code}</code>")
-        await msg.edit_text(
-            f"✅ **Uploaded to Gofile!**\n\n"
-            f"📁 **File:** `{fn}`\n"
-            f"📦 **Size:** {humanbytes(sz)}\n"
-            f"🔗 **Link:** {link}\n"
-            f"🆔 Code: `{code}`\n\n"
-            f"💡 Direct browser stream/download ho jayega."
-        )
-    except Exception as e:
-        logger.exception("gofile cmd")
-        await msg.edit_text(f"❌ Error: <code>{e}</code>")
-    finally:
-        asyncio.create_task(cleanup_dir(work))
 
 
 # ----------------------- MEGA.NZ -----------------------
