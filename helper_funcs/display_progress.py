@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 # Ek centralized store jisme saare active tasks ka data rahega
 _task_store = {}         # task_id -> task_data
 _user_tasks = {}         # user_id -> [task_ids]
-_task_messages = {}      # user_id -> message object
+_task_messages = {}      # user_id -> the ONE canonical dashboard message
+_progress_locks = {}      # user_id -> asyncio.Lock (prevents message races)
 
 # Speed tracking for smoothing
 speed_history = {}
@@ -124,7 +125,11 @@ def update_task(task_id, downloaded, total_size=0, speed=0, status=None, engine=
     task['downloaded'] = downloaded
     if total_size > 0:
         task['total_size'] = total_size
-    if speed > 0:
+    if status in ('waiting', 'queued'):
+        task['speed'] = 0
+        task['avg_speed'] = 0
+        task['speed_samples'].clear()
+    elif speed > 0:
         task['speed'] = speed
     
     # Smooth speed (moving average)
@@ -202,12 +207,118 @@ def get_user_all_tasks(user_id):
     return all_t
 
 
-def set_user_message(user_id, message):
-    _task_messages[user_id] = message
+def _message_identity(message):
+    """Stable identity for comparing two Pyrogram Message objects."""
+    if message is None:
+        return None
+    chat = getattr(message, 'chat', None)
+    chat_id = getattr(chat, 'id', None)
+    message_id = getattr(message, 'id', None)
+    if message_id is None:
+        message_id = getattr(message, 'message_id', None)
+    return chat_id, message_id
+
+
+def _progress_lock(user_id):
+    lock = _progress_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _progress_locks[user_id] = lock
+    return lock
+
+
+def set_user_message(user_id, message, replace=False):
+    """Set the canonical dashboard without silently replacing a live one.
+
+    Historically each concurrent task overwrote this mapping with its own
+    message. Both task loops then edited different messages, creating duplicate
+    BIMBO PROGRESS cards. The first live dashboard now stays canonical.
+    """
+    if message is None:
+        return _task_messages.get(user_id)
+    current = _task_messages.get(user_id)
+    if (
+        current is None
+        or replace
+        or _message_identity(current) == _message_identity(message)
+    ):
+        _task_messages[user_id] = message
+        return message
+    return current
 
 
 def get_user_message(user_id):
     return _task_messages.get(user_id)
+
+
+async def claim_user_progress_message(user_id, candidate, delete_duplicate=True):
+    """Atomically claim one dashboard message for a user.
+
+    If two downloads start together, both may create a candidate reply before
+    either stores it. The per-user lock picks exactly one and deletes the extra
+    candidate, so only one live dashboard remains in the chat.
+    """
+    if candidate is None:
+        return get_user_message(user_id)
+    async with _progress_lock(user_id):
+        current = _task_messages.get(user_id)
+        if current is None:
+            _task_messages[user_id] = candidate
+            return candidate
+        if _message_identity(current) == _message_identity(candidate):
+            return current
+        if delete_duplicate:
+            try:
+                await candidate.delete()
+            except Exception as exc:
+                logger.debug("Could not delete duplicate progress message: %s", exc)
+        return current
+
+
+def clear_user_message(user_id, message=None):
+    """Clear mapping only when it still points at the expected message."""
+    current = _task_messages.get(user_id)
+    if current is None:
+        return None
+    if message is not None and _message_identity(current) != _message_identity(message):
+        return current
+    _task_messages.pop(user_id, None)
+    _last_progress_update.pop(user_id, None)
+    return current
+
+
+async def finalize_user_progress(client, user_id, message=None, delete_if_idle=True):
+    """Delete dashboard only after the user's LAST active task finishes.
+
+    A completed task must never delete the shared dashboard while another
+    download/upload is still active.
+    """
+    async with _progress_lock(user_id):
+        current = _task_messages.get(user_id)
+        active = get_user_active_tasks(user_id)
+        if active:
+            if current is not None:
+                try:
+                    text = await build_advanced_progress_text(user_id)
+                    if text:
+                        await current.edit_text(text)
+                except Exception as exc:
+                    if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
+                        logger.debug("Final progress refresh skipped: %s", exc)
+            return False
+
+        if current is None:
+            return True
+        # With no active tasks it is safe to remove the current canonical
+        # message even if a caller still holds an older, recreated Message.
+        _task_messages.pop(user_id, None)
+        _last_progress_update.pop(user_id, None)
+        if delete_if_idle:
+            try:
+                await current.delete()
+            except Exception as exc:
+                logger.debug("Could not delete finished progress dashboard: %s", exc)
+        return True
 
 
 def cancel_task(task_id):
@@ -316,6 +427,7 @@ def get_speed_indicator(speed_bytes):
 def get_status_emoji(status):
     emojis = {
         'queued': '⏳',
+        'waiting': '⏸️',
         'downloading': '📥',
         'uploading': '📤', 
         'completed': '✅',
@@ -490,6 +602,8 @@ def status_text(task):
     s = task['status']
     if s == 'downloading':
         return "⬇️ Downloading..."
+    elif s == 'waiting':
+        return "⏸️ Waiting for safe download slot..."
     elif s == 'uploading':
         return "⬆️ Uploading..."
     elif s == 'queued':
@@ -505,39 +619,70 @@ def status_text(task):
 
 _last_progress_update = {}  # user_id -> timestamp
 
-async def update_user_progress(client, user_id):
-    """User ka progress message update karo - with FloodWait protection"""
+async def update_user_progress(client, user_id, force=False):
+    """Edit exactly one canonical dashboard with race/FloodWait protection."""
     from pyrogram.errors import FloodWait
-    
+
     now = time.time()
     last = _last_progress_update.get(user_id, 0)
-    
-    # Sirf har 3 sec mein update karo (FloodWait se bachne ke liye)
-    if now - last < 3:
+    if not force and now - last < 3:
         return
-    
-    message = get_user_message(user_id)
-    if not message:
-        return
-    
-    text = await build_advanced_progress_text(user_id)
-    if not text:
-        try:
-            await message.edit_text("✅ **All tasks completed!** 🎉")
+
+    async with _progress_lock(user_id):
+        # Re-check after waiting for another task's edit to finish.
+        now = time.time()
+        last = _last_progress_update.get(user_id, 0)
+        if not force and now - last < 3:
+            return
+
+        message = get_user_message(user_id)
+        if not message:
+            return
+
+        text = await build_advanced_progress_text(user_id)
+        if not text:
             _task_messages.pop(user_id, None)
-        except:
-            pass
-        return
-    
-    try:
-        _last_progress_update[user_id] = now
-        await message.edit_text(text)
-    except FloodWait as e:
-        logger.warning(f"⏳ FloodWait: {e.value}s - progress update paused")
-        _last_progress_update[user_id] = now + e.value
-    except Exception as e:
-        if "MESSAGE_NOT_MODIFIED" not in str(e) and "same content" not in str(e).lower():
-            logger.error(f"Progress update error: {e}")
+            _last_progress_update.pop(user_id, None)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            return
+
+        try:
+            _last_progress_update[user_id] = now
+            await message.edit_text(text)
+        except FloodWait as exc:
+            wait_seconds = getattr(exc, 'value', 3)
+            logger.warning("⏳ FloodWait: %ss - progress update paused", wait_seconds)
+            _last_progress_update[user_id] = now + wait_seconds
+        except Exception as exc:
+            error_text = str(exc)
+            if (
+                "MESSAGE_NOT_MODIFIED" in error_text.upper()
+                or "same content" in error_text.lower()
+            ):
+                return
+
+            logger.error("Progress update error: %s", exc)
+            gone_markers = (
+                "MESSAGE_ID_INVALID", "MessageIdInvalid",
+                "message to edit not found", "MESSAGE_EMPTY",
+            )
+            if not any(marker in error_text for marker in gone_markers):
+                return
+
+            # Dashboard was manually/automatically deleted. Clear the stale
+            # mapping and recreate one once, under the same lock.
+            _task_messages.pop(user_id, None)
+            _last_progress_update.pop(user_id, None)
+            if client is not None:
+                try:
+                    replacement = await client.send_message(user_id, text)
+                    _task_messages[user_id] = replacement
+                    _last_progress_update[user_id] = time.time()
+                except Exception as recreate_exc:
+                    logger.error("Could not recreate progress dashboard: %s", recreate_exc)
 
 
 # ===================== LEGACY SUPPORT =====================
@@ -699,6 +844,8 @@ def cleanup_all_progress():
     _task_store.clear()
     _user_tasks.clear()
     _task_messages.clear()
+    _progress_locks.clear()
+    _last_progress_update.clear()
     speed_history.clear()
     last_edit_time.clear()
     last_progress_text.clear()
