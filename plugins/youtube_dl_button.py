@@ -1014,9 +1014,15 @@ async def youtube_dl_call_back(bot, update, priority=100):
     if Config.YTDLP_USE_ARIA2C:
         u = (youtube_dl_url or "").lower()
         is_fragment_stream = any(k in u for k in ("m3u8", ".mpd", "youtube.com", "youtu.be", "xhamster"))
+        # sxyprn ka CDN redirect karta hai (cdn8/... -> trafficdeposit.com) aur
+        # redirect ke baad Range header mismatch hota hai (aria2 errorCode=8
+        # "Invalid range header"). Isliye sxyprn ke liye aria2c skip -> yt-dlp
+        # ka native downloader use hoga jo redirect+range sahi handle karta hai.
+        is_sxy_engine = bool(response_json.get("_sxyprn")) if isinstance(response_json, dict) else False
         # For direct CDN links (like pvvstream pro etc.), add Referer to bypass hotlink
-        # IMPORTANT: skip for custom engines (xh and ep) — their CDN URLs have signed tokens
-        if not is_fragment_stream and not is_xh_engine and not is_ep_engine:
+        # IMPORTANT: skip for custom engines (xh, ep, sxyprn) — their CDN URLs have
+        # signed tokens / redirects that break with aria2 external downloader.
+        if not is_fragment_stream and not is_xh_engine and not is_ep_engine and not is_sxy_engine:
             command_to_exec.extend([
                 "--downloader", "aria2c",
                 "--downloader-args", (
