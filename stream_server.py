@@ -17,9 +17,9 @@
 #
 # NOTE: iske liye bot ka HTTP port publicly reachable hona chahiye
 #       (Koyeb/VPS pe hota hai). Config.BIMBO_STREAM_PUBLIC_URL set karo.
+import asyncio
 import logging
 import mimetypes
-import math
 
 from aiohttp import web
 
@@ -147,7 +147,16 @@ async def dl_handler(request: web.Request):
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
     resp = web.StreamResponse(status=status, headers=headers)
-    await resp.prepare(request)
+    # prepare() ke waqt agar client (browser) pehle hi disconnect ho gaya
+    # (seek / tab band / parallel range) to "closing transport" error aata hai.
+    # Ye normal hai — chup-chaap ignore karo, log ganda na ho.
+    try:
+        await resp.prepare(request)
+    except (ConnectionError, ConnectionResetError):
+        return resp
+    except Exception:
+        # aiohttp ke ClientConnectionResetError etc bhi yahin aa jaayenge
+        return resp
 
     # Pyrogram stream_media supports offset (in 1MB chunks). We compute the
     # chunk offset and trim the first/last chunk to honour the byte range.
@@ -168,10 +177,12 @@ async def dl_handler(request: web.Request):
             sent += len(chunk)
             if bytes_to_send is not None and sent >= bytes_to_send:
                 break
-    except (ConnectionResetError, ConnectionError):
-        pass  # client closed the tab / seeked
+    except (ConnectionResetError, ConnectionError, RuntimeError, asyncio.CancelledError):
+        pass  # client closed the tab / seeked — bilkul normal
     except Exception as e:
-        logger.error(f"stream pipe: {e}")
+        # Sirf real errors log karo; disconnect wale nahi
+        if "closing transport" not in str(e) and "Connection" not in str(e):
+            logger.error(f"stream pipe: {e}")
     finally:
         try:
             await resp.write_eof()
@@ -194,11 +205,22 @@ async def health_handler(request: web.Request):
     return web.Response(text="OK - BIMBO Stream Server")
 
 
+async def favicon_handler(request: web.Request):
+    # Browser hamesha /favicon.ico maangta hai — 204 de do taaki 404 shor na ho.
+    return web.Response(status=204)
+
+
 async def start_stream_server(bot, port: int):
     """Start the aiohttp streaming server bound to the running bot client."""
+    # aiohttp ke access/server logs bahut shor karte hain (har range request +
+    # har client disconnect). Sirf warnings+ dikhao.
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp.server").setLevel(logging.CRITICAL)
+
     app = web.Application()
     app["bot"] = bot
     app.router.add_get("/", health_handler)
+    app.router.add_get("/favicon.ico", favicon_handler)
     app.router.add_get("/watch/{token}", watch_handler)
     app.router.add_get("/dl/{token}", dl_handler)
     runner = web.AppRunner(app)
