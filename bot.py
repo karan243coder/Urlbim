@@ -181,7 +181,12 @@ if __name__ == "__main__":
     if Config.MAINTENANCE_MODE:
         logger.warning("⚠️  MAINTENANCE_MODE is ON — only owner can use bot.")
 
-    threading.Thread(target=run_health_server, daemon=True).start()
+    # Single-port mode (Koyeb/Render): stream server khud HEALTH_PORT pe chalega
+    # aur "/" pe health check bhi de dega — isliye purana threaded health server
+    # tabhi start karo jab stream server alag port maang raha ho.
+    _single_port = not bool(Config.BIMBO_STREAM_PORT)
+    if not _single_port:
+        threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=start_aria2_daemon, daemon=True).start()
     time.sleep(2)
     threading.Thread(target=auto_cleanup_loop, daemon=True).start()
@@ -212,11 +217,15 @@ if __name__ == "__main__":
         except Exception as ce:
             logger.warning(f"Cleaner startup hook failed (will auto-start on first msg): {ce}")
         # Start the video stream server (/watch, /dl) for /stream links.
+        # Default (single-port): stream server HEALTH_PORT (8080) pe chalega —
+        # Koyeb ke ek public port me sab fit. Alag port chahiye to
+        # BIMBO_STREAM_PORT set kar do (VPS pe useful).
         try:
             from stream_server import start_stream_server
-            stream_port = Config.BIMBO_STREAM_PORT or (HEALTH_PORT + 1)
+            stream_port = Config.BIMBO_STREAM_PORT or HEALTH_PORT
             loop.create_task(start_stream_server(BIMBO_CLIENT, stream_port))
-            logger.info(f"🎬 Stream server hooked on port {stream_port}")
+            logger.info(f"🎬 Stream server hooked on port {stream_port} "
+                        f"({'single-port' if stream_port == HEALTH_PORT else 'separate port'})")
         except Exception as se:
             logger.warning(f"Stream server startup failed: {se}")
         # idle
