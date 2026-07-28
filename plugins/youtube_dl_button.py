@@ -20,6 +20,7 @@ from plugins.custom_thumbnail import Gthumb01, Gthumb02, Mdata01, Mdata02, Mdata
 from pyrogram import enums
 from pyrogram.types import InputMediaVideo, InputMediaDocument
 from helper_funcs.display_progress import progress_for_pyrogram, humanbytes, TimeFormatter
+from plugins.xhamster_runtime import XHAMSTER_DOWNLOAD_SEMAPHORE
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -27,8 +28,11 @@ logger = logging.getLogger(__name__)
 
 PROGRESS_UPDATE_INTERVAL = 5
 
+# xHamster's CDN throttles shared cloud egress aggressively. The shared
+# semaphore is imported from xhamster_runtime so every xHamster plugin obeys it.
+
 # Import shared download semaphore from utils
-# Semaphore removed - using background tasks instead
+# Generic-site semaphore is still handled by the surrounding queue.
 
 
 async def safe_send_media(func, *args, **kwargs):
@@ -1030,8 +1034,12 @@ async def youtube_dl_call_back(bot, update):
     # Semaphore removed - running as background task
     logger.info("Starting download task for user %s", update.from_user.id)
     # Register task in unified progress tracker for advanced UI
-    from helper_funcs.display_progress import register_task, update_task, set_user_message, update_user_progress, _task_messages
-    progress_task_id = f"ytdlp_{update.from_user.id}_{int(time.time())}"
+    from helper_funcs.display_progress import (
+        register_task, update_task, remove_task, get_task,
+        get_user_message, claim_user_progress_message,
+        update_user_progress, finalize_user_progress,
+    )
+    progress_task_id = f"ytdlp_{update.from_user.id}_{time.time_ns()}"
     register_task(
         task_id=progress_task_id,
         user_id=update.from_user.id,
@@ -1041,22 +1049,60 @@ async def youtube_dl_call_back(bot, update):
         engine='yt-dlp'
     )
     
-    # Create a dedicated progress message for this task
-    progress_msg_id = None
-    try:
-        progress_msg = await update.message.reply_text(
-            f"📥 **Starting Download**\n\n"
-            f"📁 File: {display_name}\n"
-            f"🔄 Status: Initializing..."
+    # ONE canonical dashboard per user. If another task is already running,
+    # reuse its message instead of creating a second BIMBO PROGRESS card.
+    progress_msg = get_user_message(update.from_user.id)
+    if progress_msg is None:
+        candidate_msg = None
+        created_reply = False
+        try:
+            candidate_msg = await update.message.reply_text(
+                f"📥 **Starting Download**\n\n"
+                f"📁 File: {display_name}\n"
+                f"🔄 Status: Initializing..."
+            )
+            created_reply = True
+        except Exception as e:
+            logger.error(f"Failed to create progress message: {e}")
+            candidate_msg = update.message
+
+        # Handles simultaneous starts: one candidate wins, extra reply is
+        # deleted atomically. Never delete the original callback message.
+        progress_msg = await claim_user_progress_message(
+            update.from_user.id,
+            candidate_msg,
+            delete_duplicate=created_reply,
         )
-        progress_msg_id = progress_msg.id
-        # Store message with task_id (not user_id) for task-specific tracking
-        _task_messages[progress_task_id] = progress_msg
-    except Exception as e:
-        logger.error(f"Failed to create progress message: {e}")
-        progress_msg = update.message
-        progress_msg_id = progress_msg.id
-        _task_messages[progress_task_id] = progress_msg
+
+    progress_msg_id = progress_msg.id
+    await update_user_progress(bot, update.from_user.id, force=True)
+
+    # Large xHamster HLS streams are serialized per bot instance. The second
+    # task stays visible as WAITING instead of opening another CDN stream and
+    # freezing both downloads on shared-IP throttling.
+    xh_slot_acquired = False
+    if is_xh_engine:
+        if XHAMSTER_DOWNLOAD_SEMAPHORE.locked():
+            update_task(
+                progress_task_id, 0, 0, 0,
+                status='waiting', engine='yt-dlp'
+            )
+            await safe_edit(
+                update.message,
+                build_stage_card(
+                    display_name,
+                    "Queued safely — another xHamster download is active",
+                    "0 s",
+                ),
+            )
+            await update_user_progress(bot, update.from_user.id, force=True)
+        await XHAMSTER_DOWNLOAD_SEMAPHORE.acquire()
+        xh_slot_acquired = True
+        update_task(
+            progress_task_id, 0, 0, 0,
+            status='starting', engine='yt-dlp'
+        )
+        await update_user_progress(bot, update.from_user.id, force=True)
     
     try:
         process = await asyncio.create_subprocess_exec(
@@ -1065,116 +1111,213 @@ async def youtube_dl_call_back(bot, update):
             stderr=asyncio.subprocess.STDOUT,
         )
     except FileNotFoundError:
-        await safe_edit(progress_msg, "**ERROR:** `yt-dlp` install nahi hai. Requirements install/deploy dobara karo.")
-        # Semaphore release removed
+        if xh_slot_acquired:
+            XHAMSTER_DOWNLOAD_SEMAPHORE.release()
+            xh_slot_acquired = False
+        remove_task(progress_task_id)
+        await safe_edit(update.message, "**ERROR:** `yt-dlp` install nahi hai. Requirements install/deploy dobara karo.")
+        await finalize_user_progress(bot, update.from_user.id, progress_msg)
         return
+    except Exception:
+        if xh_slot_acquired:
+            XHAMSTER_DOWNLOAD_SEMAPHORE.release()
+            xh_slot_acquired = False
+        remove_task(progress_task_id)
+        await finalize_user_progress(bot, update.from_user.id, progress_msg)
+        raise
 
     last_progress_update = 0
     ytdlp_output = ""
 
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
+    last_percent_value = -1.0
+    last_percent_at = time.monotonic()
+    stalled_by_watchdog = False
 
-        decoded_line = line.decode(errors="ignore").strip()
-        if decoded_line:
-            ytdlp_output += decoded_line + "\n"
-
-        now = time.time()
-        elapsed_str = TimeFormatter(milliseconds=int((now - download_start_time) * 1000)) or "0 s"
-
-        if "[download]" in decoded_line and "%" in decoded_line:
+    try:
+        while True:
             try:
-                if now - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
-                    percent_match = re.search(r'(\d+\.?\d*)%', decoded_line)
-                    percentage = float(percent_match.group(1)) if percent_match else 0.0
-
-                    speed_match = re.search(r'at\s+(.+?)(?:\s+ETA|$)', decoded_line)
-                    speed = speed_match.group(1).strip() if speed_match else "Calculating..."
-
-                    size_match = re.search(r'of\s+~?\s*([\d\.]+\s*[KMGTP]?i?B)', decoded_line)
-                    total_size = size_match.group(1).strip() if size_match else "Unknown"
-
-                    eta_match = re.search(r'ETA\s+([0-9:]+)', decoded_line)
-                    eta = eta_match.group(1).strip() if eta_match else "Calculating..."
-
-                    downloaded_text = "--"
-                    total_bytes = size_text_to_bytes(total_size)
-                    if total_bytes > 0:
-                        downloaded_bytes = int((percentage / 100) * total_bytes)
-                        downloaded_text = humanbytes(downloaded_bytes)
-                    
-                    # Update central unified advanced progress card
+                line = await asyncio.wait_for(
+                    process.stdout.readline(), timeout=30
+                )
+            except asyncio.TimeoutError:
+                if (
+                    is_xh_engine
+                    and time.monotonic() - last_percent_at
+                    >= Config.XHAMSTER_STALL_TIMEOUT
+                ):
+                    stalled_by_watchdog = True
+                    ytdlp_output += (
+                        "\nERROR: xHamster download stalled with no percentage "
+                        f"progress for {Config.XHAMSTER_STALL_TIMEOUT}s\n"
+                    )
                     try:
-                        speed_bytes = size_text_to_bytes(speed.replace("/s", "").strip())
-                        update_task(
-                            task_id=progress_task_id,
-                            downloaded=downloaded_bytes,
-                            total_size=total_bytes,
-                            speed=speed_bytes,
-                            status='downloading',
-                            engine='yt-dlp'
-                        )
-                        set_user_message(update.from_user.id, progress_msg)
-                        await update_user_progress(bot, update.from_user.id)
-                    except Exception as e:
-                        logger.error(f"Unified progress error: {e}")
-                        # Fallback to individual progress card
-                        progress_text = build_download_card(
-                            display_name=display_name,
-                            percentage=percentage,
-                            speed_text=speed,
-                            total_size_text=total_size,
-                            eta_text=eta,
-                            elapsed_text=elapsed_str,
-                            downloaded_text=downloaded_text,
-                        )
-                        await safe_edit(progress_msg, progress_text)
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    break
+                continue
+            if not line:
+                break
+
+            decoded_line = line.decode(errors="ignore").strip()
+            if decoded_line:
+                ytdlp_output += decoded_line + "\n"
+
+            now = time.time()
+            elapsed_str = TimeFormatter(milliseconds=int((now - download_start_time) * 1000)) or "0 s"
+
+            if "[download]" in decoded_line and "%" in decoded_line:
+                observed_match = re.search(r'(\d+\.?\d*)%', decoded_line)
+                observed_pct = float(observed_match.group(1)) if observed_match else -1.0
+                if observed_pct > last_percent_value + 0.001:
+                    last_percent_value = observed_pct
+                    last_percent_at = time.monotonic()
+                try:
+                    if now - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                        percent_match = re.search(r'(\d+\.?\d*)%', decoded_line)
+                        percentage = float(percent_match.group(1)) if percent_match else 0.0
+
+                        speed_match = re.search(r'at\s+(.+?)(?:\s+ETA|$)', decoded_line)
+                        speed = speed_match.group(1).strip() if speed_match else "Calculating..."
+
+                        size_match = re.search(r'of\s+~?\s*([\d\.]+\s*[KMGTP]?i?B)', decoded_line)
+                        total_size = size_match.group(1).strip() if size_match else "Unknown"
+
+                        eta_match = re.search(r'ETA\s+([0-9:]+)', decoded_line)
+                        eta = eta_match.group(1).strip() if eta_match else "Calculating..."
+
+                        downloaded_text = "--"
+                        total_bytes = size_text_to_bytes(total_size)
+                        if total_bytes > 0:
+                            downloaded_bytes = int((percentage / 100) * total_bytes)
+                            downloaded_text = humanbytes(downloaded_bytes)
                     
+                        # Update central unified advanced progress card
+                        try:
+                            speed_bytes = size_text_to_bytes(speed.replace("/s", "").strip())
+                            update_task(
+                                task_id=progress_task_id,
+                                downloaded=downloaded_bytes,
+                                total_size=total_bytes,
+                                speed=speed_bytes,
+                                status='downloading',
+                                engine='yt-dlp'
+                            )
+                            await update_user_progress(bot, update.from_user.id)
+                        except Exception as e:
+                            logger.error(f"Unified progress error: {e}")
+                            # Fallback to individual progress card
+                            progress_text = build_download_card(
+                                display_name=display_name,
+                                percentage=percentage,
+                                speed_text=speed,
+                                total_size_text=total_size,
+                                eta_text=eta,
+                                elapsed_text=elapsed_str,
+                                downloaded_text=downloaded_text,
+                            )
+                            await safe_edit(progress_msg, progress_text)
+                    
+                        last_progress_update = now
+                except Exception as e:
+                    logger.error(f"Progress parse error: {e}")
+
+            elif is_xh_engine and any(marker in decoded_line.lower() for marker in (
+                "429", "too many requests", "retrying fragment",
+                "http error", "timed out",
+            )):
+                if (
+                    time.monotonic() - last_percent_at
+                    >= Config.XHAMSTER_STALL_TIMEOUT
+                ):
+                    stalled_by_watchdog = True
+                    ytdlp_output += (
+                        "\nERROR: xHamster CDN retries exceeded the no-progress "
+                        f"limit ({Config.XHAMSTER_STALL_TIMEOUT}s)\n"
+                    )
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    break
+                current_task = get_task(progress_task_id) or {}
+                update_task(
+                    progress_task_id,
+                    downloaded=current_task.get('downloaded', 0),
+                    total_size=current_task.get('total_size', 0),
+                    speed=current_task.get('speed', 0),
+                    status='waiting', engine='yt-dlp'
+                )
+                if now - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                    logger.warning(
+                        "xhamster CDN retry for user %s: %s",
+                        update.from_user.id, decoded_line[-300:],
+                    )
+                    await safe_edit(
+                        update.message,
+                        build_stage_card(
+                            display_name,
+                            "CDN retry/cooldown — waiting safely",
+                            elapsed_str,
+                        ),
+                    )
+                    await update_user_progress(bot, update.from_user.id, force=True)
                     last_progress_update = now
-            except Exception as e:
-                logger.error(f"Progress parse error: {e}")
 
-        elif ("Merging formats into" in decoded_line or "[Merger]" in decoded_line) and now - last_progress_update >= 3:
-            await safe_edit(update.message, build_stage_card(display_name, "Merging audio + video streams...", elapsed_str))
-            last_progress_update = now
+            elif ("Merging formats into" in decoded_line or "[Merger]" in decoded_line) and now - last_progress_update >= 3:
+                await safe_edit(update.message, build_stage_card(display_name, "Merging audio + video streams...", elapsed_str))
+                last_progress_update = now
 
-        elif ("[ExtractAudio]" in decoded_line or "Destination:" in decoded_line) and tg_send_type == "audio" and now - last_progress_update >= 3:
-            await safe_edit(update.message, build_stage_card(display_name, "Extracting audio stream...", elapsed_str))
-            last_progress_update = now
+            elif ("[ExtractAudio]" in decoded_line or "Destination:" in decoded_line) and tg_send_type == "audio" and now - last_progress_update >= 3:
+                await safe_edit(update.message, build_stage_card(display_name, "Extracting audio stream...", elapsed_str))
+                last_progress_update = now
 
-        elif ("[EmbedSubtitle]" in decoded_line or "[SubtitlesConvertor]" in decoded_line) and now - last_progress_update >= 3:
-            await safe_edit(update.message, build_stage_card(display_name, "Embedding subtitles...", elapsed_str))
-            last_progress_update = now
+            elif ("[EmbedSubtitle]" in decoded_line or "[SubtitlesConvertor]" in decoded_line) and now - last_progress_update >= 3:
+                await safe_edit(update.message, build_stage_card(display_name, "Embedding subtitles...", elapsed_str))
+                last_progress_update = now
 
-        elif "[download]" in decoded_line and now - last_progress_update >= 3:
-            stage_text = "Downloading video data..."
-            lower_line = decoded_line.lower()
-            if "resum" in lower_line:
-                stage_text = "Resuming partial download..."
-            elif "destination" in lower_line:
-                stage_text = "Saving file to disk..."
-            elif "webpage" in lower_line:
-                stage_text = "Fetching webpage info..."
-            elif "m3u8" in lower_line:
-                stage_text = "Fetching stream playlist..."
-            elif "fragment" in lower_line:
-                stage_text = "Downloading stream fragments..."
-            await safe_edit(update.message, build_stage_card(display_name, stage_text, elapsed_str))
-            last_progress_update = now
+            elif "[download]" in decoded_line and now - last_progress_update >= 3:
+                stage_text = "Downloading video data..."
+                lower_line = decoded_line.lower()
+                if "resum" in lower_line:
+                    stage_text = "Resuming partial download..."
+                elif "destination" in lower_line:
+                    stage_text = "Saving file to disk..."
+                elif "webpage" in lower_line:
+                    stage_text = "Fetching webpage info..."
+                elif "m3u8" in lower_line:
+                    stage_text = "Fetching stream playlist..."
+                elif "fragment" in lower_line:
+                    stage_text = "Downloading stream fragments..."
+                await safe_edit(update.message, build_stage_card(display_name, stage_text, elapsed_str))
+                last_progress_update = now
 
-    await process.wait()
+        await process.wait()
+    finally:
+        if xh_slot_acquired:
+            XHAMSTER_DOWNLOAD_SEMAPHORE.release()
+            xh_slot_acquired = False
     ytdlp_output = ytdlp_output.strip()
 
     if process.returncode != 0:
         last_error = "\n".join(ytdlp_output.splitlines()[-8:]) or "Unknown yt-dlp error"
 
+        if is_xh_engine and stalled_by_watchdog:
+            await safe_edit(
+                update.message,
+                "❌ **xHamster download stalled and was stopped safely.**\n\n"
+                f"{Config.XHAMSTER_STALL_TIMEOUT // 60} minute tak percentage "
+                "aage nahi badha (CDN retry/rate-limit). Partial data resume ke "
+                "liye rakha hai; kuch minute baad sirf ek xHamster video retry karo.",
+            )
+            remove_task(progress_task_id)
+            await finalize_user_progress(bot, update.from_user.id, progress_msg)
+            return
+
         # A second immediate page extraction after HTTP 429 only extends the
         # server-side block. Stop cleanly and let the engine's host cooldown
         # expire instead of hammering the same shared cloud IP.
         if is_xh_engine and re.search(r"(?:HTTP Error\s*)?429|Too Many Requests", last_error, re.I):
-            asyncio.create_task(clendir(tmp_directory_for_each_user))
             await safe_edit(
                 update.message,
                 "❌ **xHamster temporarily rate-limited this server (HTTP 429).**\n\n"
@@ -1182,6 +1325,8 @@ async def youtube_dl_call_back(bot, update):
                 "2–5 minute baad retry karo. Agar Koyeb shared IP par baar-baar aaye, "
                 "private `BIMBO_HTTP_PROXY` configure karo.",
             )
+            remove_task(progress_task_id)
+            await finalize_user_progress(bot, update.from_user.id, progress_msg)
             return
 
         # For non-429 failures, try the original page once as a compatibility
@@ -1253,6 +1398,8 @@ async def youtube_dl_call_back(bot, update):
                         message_id=update.message.id,
                         text=f"**ERROR: Download failed ⚠️**\n`Custom engine:\n{last_error[:420]}\n\nFallback:\n{fb_last_error[:420]}`",
                     )
+                    remove_task(progress_task_id)
+                    await finalize_user_progress(bot, update.from_user.id, progress_msg)
                     # Semaphore release removed
                     return
             except Exception as e:
@@ -1262,6 +1409,8 @@ async def youtube_dl_call_back(bot, update):
                     message_id=update.message.id,
                     text=f"**ERROR: Download failed ⚠️**\n`{last_error[:650]}\n\nFallback exception: {str(e)[:200]}`",
                 )
+                remove_task(progress_task_id)
+                await finalize_user_progress(bot, update.from_user.id, progress_msg)
                 # Semaphore release removed
                 return
 
@@ -1287,6 +1436,8 @@ async def youtube_dl_call_back(bot, update):
                         message_id=update.message.id,
                         text=f"**ERROR: Eporner download failed ⚠️**\n`{last_error[:420]}\n\nFresh re-extract bhi fail ho gaya.`",
                     )
+                    remove_task(progress_task_id)
+                    await finalize_user_progress(bot, update.from_user.id, progress_msg)
                     # Semaphore release removed
                     return
 
@@ -1320,6 +1471,8 @@ async def youtube_dl_call_back(bot, update):
                         message_id=update.message.id,
                         text=f"**ERROR: Eporner fresh URL not found ⚠️**\n`{last_error[:420]}`",
                     )
+                    remove_task(progress_task_id)
+                    await finalize_user_progress(bot, update.from_user.id, progress_msg)
                     # Semaphore release removed
                     return
 
@@ -1393,6 +1546,8 @@ async def youtube_dl_call_back(bot, update):
                         message_id=update.message.id,
                         text=f"**ERROR: Eporner download failed ⚠️**\n`Original:\n{last_error[:420]}\n\nRetry:\n{fb_last_error[:420]}`",
                     )
+                    remove_task(progress_task_id)
+                    await finalize_user_progress(bot, update.from_user.id, progress_msg)
                     # Semaphore release removed
                     return
 
@@ -1403,6 +1558,8 @@ async def youtube_dl_call_back(bot, update):
                     message_id=update.message.id,
                     text=f"**ERROR: Eporner download failed ⚠️**\n`{last_error[:650]}\n\nFallback exception: {str(e)[:200]}`",
                 )
+                remove_task(progress_task_id)
+                await finalize_user_progress(bot, update.from_user.id, progress_msg)
                 # Semaphore release removed
                 return
         else:
@@ -1412,13 +1569,17 @@ async def youtube_dl_call_back(bot, update):
                 message_id=update.message.id,
                 text=f"**ERROR: Download failed ⚠️**\n`{last_error[:900]}`",
             )
+            remove_task(progress_task_id)
+            await finalize_user_progress(bot, update.from_user.id, progress_msg)
             # Semaphore release removed
             return
 
     file_size, file_location = await get_flocation(download_directory, youtube_dl_ext)
 
     if file_size == 0:
-        await safe_edit(progress_msg, "ERROR: File not found 🙁")
+        await safe_edit(update.message, "ERROR: File not found 🙁")
+        remove_task(progress_task_id)
+        await finalize_user_progress(bot, update.from_user.id, progress_msg)
         asyncio.create_task(clendir(tmp_directory_for_each_user))
         # Semaphore release removed
         return
@@ -1428,6 +1589,20 @@ async def youtube_dl_call_back(bot, update):
     needs_split = file_size > MAX_TELEGRAM_SIZE
     
     if needs_split:
+        # Transition the finished download into one tracked split/upload task.
+        # This keeps the same dashboard alive when another download is active.
+        split_task_id = f"split_{update.from_user.id}_{time.time_ns()}"
+        remove_task(progress_task_id)
+        register_task(
+            split_task_id, update.from_user.id, display_name, file_size,
+            task_type='upload', engine='ffmpeg'
+        )
+        update_task(
+            split_task_id, 0, file_size, 0,
+            status='starting', engine='ffmpeg'
+        )
+        await update_user_progress(bot, update.from_user.id, force=True)
+
         # Show split progress message
         split_start_text = (
             f"╭━━━〔 ✂️ LARGE FILE DETECTED 〕━━━╮\n"
@@ -1442,7 +1617,9 @@ async def youtube_dl_call_back(bot, update):
         split_files = await split_large_file(file_location, MAX_TELEGRAM_SIZE, progress_msg)
         
         if not split_files or len(split_files) == 0:
-            await safe_edit(progress_msg, "❌ ERROR: Failed to split file")
+            await safe_edit(update.message, "❌ ERROR: Failed to split file")
+            remove_task(split_task_id)
+            await finalize_user_progress(bot, update.from_user.id, progress_msg)
             asyncio.create_task(clendir(tmp_directory_for_each_user))
             # Semaphore release removed
             return
@@ -1457,6 +1634,11 @@ async def youtube_dl_call_back(bot, update):
             f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
         )
         await safe_edit(progress_msg, split_complete_text)
+        update_task(
+            split_task_id, 0, file_size, 0,
+            status='uploading', engine='pyrogram'
+        )
+        await update_user_progress(bot, update.from_user.id, force=True)
         
         # Upload all parts with individual progress tracking
         try:
@@ -1549,11 +1731,12 @@ async def youtube_dl_call_back(bot, update):
             if first_part_thumbnail:
                 asyncio.create_task(clendir(first_part_thumbnail))
             
-            # Delete progress message
-            try:
-                await progress_msg.delete()
-            except:
-                pass
+            # Finish only this split task. Keep the canonical dashboard if the
+            # user's second download/upload is still active.
+            remove_task(split_task_id)
+            await finalize_user_progress(
+                bot, update.from_user.id, progress_msg, delete_if_idle=True
+            )
             
             # Send success message
             upload_duration = (datetime.now() - start).seconds
@@ -1597,27 +1780,17 @@ async def youtube_dl_call_back(bot, update):
             
         except Exception as e:
             logger.error(f"Split upload error: {e}")
-            await safe_edit(progress_msg, f"❌ ERROR: {str(e)[:200]}")
+            await safe_edit(update.message, f"❌ ERROR: {str(e)[:200]}")
+            remove_task(split_task_id)
+            await finalize_user_progress(bot, update.from_user.id, progress_msg)
             asyncio.create_task(clendir(tmp_directory_for_each_user))
             # Semaphore release removed
             return
 
-    # Convert download message to upload message (reuse same message)
-    upload_start_text = (
-        f"╭━━━〔 📤 UPLOAD STARTING 〕━━━╮\n"
-        f"┃ 📁 File: {trim_text(file_name, 35)}\n"
-        f"┃ 📦 Size: {humanbytes(file_size)}\n"
-        f"┃ 🔄 Status: Preparing upload...\n"
-        f"╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
-    )
-    await safe_edit(progress_msg, upload_start_text)
-    
-    # Store the upload progress message ID for later deletion
+    # Atomically transition this item from download to upload inside the SAME
+    # canonical dashboard. Do not replace it with update.message.
     upload_progress_msg_id = progress_msg_id
-    
-    # Register UPLOAD task in unified progress tracker
-    from helper_funcs.display_progress import register_task, update_task, set_user_message, remove_task
-    upload_task_id = f"upload_{update.from_user.id}_{int(time.time())}"
+    upload_task_id = f"upload_{update.from_user.id}_{time.time_ns()}"
     register_task(
         task_id=upload_task_id,
         user_id=update.from_user.id,
@@ -1626,10 +1799,12 @@ async def youtube_dl_call_back(bot, update):
         task_type='upload',
         engine='pyrogram'
     )
-    set_user_message(update.from_user.id, update.message)
-    
-    # Remove download task from tracker
+    update_task(
+        upload_task_id, 0, file_size, 0,
+        status='uploading', engine='pyrogram'
+    )
     remove_task(progress_task_id)
+    await update_user_progress(bot, update.from_user.id, force=True)
 
     thumbnail = None
     duration = 0
@@ -1719,40 +1894,14 @@ async def youtube_dl_call_back(bot, update):
                 progress_args=(Translation.BIMBO_UPLOAD_START, progress_msg, start_time, file_name, False),
             )
 
-        # Mark task as completed in unified tracker BEFORE log upload
-        from helper_funcs.display_progress import update_task, remove_task
+        # Mark/remove only THIS task. The shared dashboard is deleted only when
+        # no other task for the user remains active.
         update_task(upload_task_id, file_size, file_size, 0, 'completed', 'pyrogram')
-        
-        # Remove the task from tracker to stop progress updates
         remove_task(upload_task_id)
-        
-        # Wait a bit for progress callback to finish
-        await asyncio.sleep(3)
-        
-        # DELETE the upload progress message with retry mechanism
-        delete_success = False
-        for attempt in range(3):
-            try:
-                await progress_msg.delete()
-                logger.info(f"Deleted upload progress message: {progress_msg.id} (attempt {attempt + 1})")
-                delete_success = True
-                break
-            except Exception as e:
-                logger.warning(f"Could not delete upload progress message {progress_msg.id} (attempt {attempt + 1}): {e}")
-                if attempt < 2:
-                    await asyncio.sleep(1)
-        
-        # If direct delete failed, try using bot.delete_messages
-        if not delete_success:
-            try:
-                await bot.delete_messages(
-                    chat_id=update.message.chat.id,
-                    message_ids=progress_msg.id
-                )
-                logger.info(f"Deleted upload progress message using bot.delete_messages: {progress_msg.id}")
-                delete_success = True
-            except Exception as e:
-                logger.warning(f"bot.delete_messages also failed: {e}")
+        await asyncio.sleep(1)
+        await finalize_user_progress(
+            bot, update.from_user.id, progress_msg, delete_if_idle=True
+        )
         
         # DELETE the original message (update.message) if it's different from progress_msg
         if update.message.id != progress_msg.id:
@@ -1822,6 +1971,8 @@ async def youtube_dl_call_back(bot, update):
         asyncio.create_task(clendir(file_location))
         if thumbnail:
             asyncio.create_task(clendir(thumbnail))
+        remove_task(upload_task_id)
+        await finalize_user_progress(bot, update.from_user.id, progress_msg)
         err_str = str(e)
         # If the message was already deleted or invalid, skip (cleaner already removed it)
         if any(k in err_str for k in ("MESSAGE_ID_INVALID", "MessageIdInvalid", "message to edit not found",

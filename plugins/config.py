@@ -106,6 +106,11 @@ class Config(object):
     YTDLP_CONCURRENT_FRAGMENTS = _int("YTDLP_CONCURRENT_FRAGMENTS", 10)
     # xHamster's CDN rate-limits bursty HLS fragment traffic more aggressively.
     XHAMSTER_CONCURRENT_FRAGMENTS = max(1, _int("XHAMSTER_CONCURRENT_FRAGMENTS", 1))
+    # One large xHamster stream per server/IP. Multiple 10MB/s streams from the
+    # same Koyeb egress are much more likely to freeze on CDN HTTP 429 retries.
+    XHAMSTER_MAX_CONCURRENT_DOWNLOADS = max(1, _int("XHAMSTER_MAX_CONCURRENT_DOWNLOADS", 1))
+    # Kill a subprocess that has made no percentage progress for this long.
+    XHAMSTER_STALL_TIMEOUT = max(180, _int("XHAMSTER_STALL_TIMEOUT", 600))
     # Public videos should not receive stale browser cookies. Enable only for
     # login/age-gated content with a private, current cookies.txt file.
     XHAMSTER_USE_COOKIES = is_enabled(_str("XHAMSTER_USE_COOKIES", "false"), False)

@@ -44,6 +44,7 @@ from utils import (
     is_admin, is_premium, rate_limit_check, get_url,
 )
 from database.xhamster_queue import create_job, get_job, claim_next_item, finish_item, update_job, cancel_job, pause_job, resume_job
+from plugins.xhamster_runtime import XHAMSTER_DOWNLOAD_SEMAPHORE
 from plugins.xhamster_engine import (
     is_xhamster, _extract_window_initials, _clean_xhamster_page_url,
     _base_of, UA, QLABEL, extract as xh_extract, _normalize_html_for_urls,
@@ -905,8 +906,7 @@ async def _safe_answer(c: CallbackQuery, text: str = "", show_alert: bool = Fals
         pass
 
 
-# Concurrency limiter for Download All (max 2 simultaneous downloads on Koyeb free 512MB RAM)
-_XH_DOWNLOAD_SEM = asyncio.Semaphore(2)
+# Shared stream limiter is imported from plugins.xhamster_runtime.
 
 
 async def _xh_fetch_qualities_for_item(item, session: aiohttp.ClientSession):
@@ -1122,33 +1122,32 @@ async def xh_callbacks(client: Client, c: CallbackQuery):
                         "final_url": _preferred_mirror(item.get("url", "")),
                     })
 
-            # Step 2: Launch downloads (semaphore limits concurrency to max 2 for Koyeb 512MB safety)
+            # Step 2: create jobs; shared runtime semaphore runs one stream at a time.
             async def _run_one(job):
-                async with _XH_DOWNLOAD_SEM:
-                    item = job["item"]
-                    title = item.get("title", "Video")
-                    i = job["idx"]
-                    url = job["final_url"]
-                    best_h = job["best_h"]
-                    best_m3u8 = job["best_m3u8"]
-                    try:
-                        prog_msg = await client.send_message(
-                            c.message.chat.id,
-                            f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}...",
-                            reply_to_message_id=c.message.id,
-                        )
-                    except Exception:
-                        try:
-                            prog_msg = await c.message.reply_text(
-                                f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}..."
-                            )
-                        except Exception as e:
-                            logger.warning(f"xh all send prog fail: {e}")
-                            return
-                    await _xh_download_and_upload(
-                        client, prog_msg, c.from_user, url, best_m3u8, title, best_h, "video",
-                        {"User-Agent": UA, "Referer": url, "Origin": _base_of(url)}
+                item = job["item"]
+                title = item.get("title", "Video")
+                i = job["idx"]
+                url = job["final_url"]
+                best_h = job["best_h"]
+                best_m3u8 = job["best_m3u8"]
+                try:
+                    prog_msg = await client.send_message(
+                        c.message.chat.id,
+                        f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}...",
+                        reply_to_message_id=c.message.id,
                     )
+                except Exception:
+                    try:
+                        prog_msg = await c.message.reply_text(
+                            f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}..."
+                        )
+                    except Exception as e:
+                        logger.warning(f"xh all send prog fail: {e}")
+                        return
+                await _xh_download_and_upload(
+                    client, prog_msg, c.from_user, url, best_m3u8, title, best_h, "video",
+                    {"User-Agent": UA, "Referer": url, "Origin": _base_of(url)}
+                )
 
             for job in download_jobs:
                 asyncio.create_task(_run_one(job))
@@ -1158,7 +1157,7 @@ async def xh_callbacks(client: Client, c: CallbackQuery):
                 await status_msg.edit_text(
                     f"✅ **Download All Started!**\n\n"
                     f"📥 {len(items)} videos queue me hain (best quality per video).\n"
-                    f"⚡ Max 2 concurrent downloads (Koyeb RAM-safe).\n"
+                    f"⚡ One safe xHamster stream at a time (429 protection).\n"
                     f"Har video alag progress bar ke saath ayegi..."
                 )
             except Exception:
@@ -1453,63 +1452,75 @@ async def _xh_download_and_upload(client, status_msg, user, webpage_url, m3u8_ur
     target_url = m3u8_url or webpage_url
     cmd.append(target_url)
 
+    if XHAMSTER_DOWNLOAD_SEMAPHORE.locked():
+        try:
+            await status_msg.edit_text(
+                "⏳ **Queued safely** — another xHamster download is active."
+            )
+        except Exception:
+            pass
+    await XHAMSTER_DOWNLOAD_SEMAPHORE.acquire()
+    proc = None
     start_ts = time.time()
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-    )
-    last_edit = 0
-    speed = "0 KiB/s"; eta_s = "--:--"; pct = 0.0; total_bytes = 0; downloaded_bytes = 0
     try:
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode("utf-8", errors="ignore").strip()
-            m = re.search(r"\[download\]\s+([\d.]+)%", decoded)
-            if m:
-                pct = float(m.group(1))
-                ms = re.search(r"([\d.]+[KMG]i?B/s)", decoded)
-                if ms: speed = ms.group(1)
-                me = re.search(r"ETA\s+([\d:]+)", decoded)
-                if me: eta_s = me.group(1)
-                mz = re.search(r"of\s+~?\s*([\d.]+\s*[KMG]?i?B)", decoded)
-                if mz:
-                    _t = mz.group(1)
-                    try:
-                        # parse to bytes roughly
-                        unit_map = {"B":1,"K":1024,"KI":1024,"KB":1024,"M":1024**2,"MI":1024**2,"MB":1024**2,
-                                    "G":1024**3,"GI":1024**3,"GB":1024**3,"T":1024**4,"TI":1024**4,"TB":1024**4}
-                        val = float(re.search(r"([\d.]+)", _t).group(1))
-                        u = re.sub(r"[\d.\s]", "", _t).upper()
-                        total_bytes = int(val * unit_map.get(u, 1))
-                        downloaded_bytes = int((pct/100)*total_bytes)
-                    except Exception:
-                        total_bytes = 0
-                now = time.time()
-                if now - last_edit > 3:
-                    last_edit = now
-                    bar = "█"*int(pct//5) + "░"*(20 - int(pct//5))
-                    elapsed = int(now - start_ts)
-                    dl_text = _hb(downloaded_bytes) if downloaded_bytes else f"{pct:.1f}%"
-                    tt_text = _hb(total_bytes) if total_bytes else "??"
-                    try:
-                        await status_msg.edit_text(
-                            f"📥 **Downloading...**\n\n"
-                            f"🎬 {safe_title[:60]}\n"
-                            f"┃ `{bar}` {pct:.1f}%\n"
-                            f"┠ ⚡ Speed: `{speed}`\n"
-                            f"┠ 📦 {dl_text} / {tt_text}\n"
-                            f"┠ ⏳ ETA: `{eta_s}` | ⏱ {elapsed}s\n"
-                            f"┠ 🎬 {height}p | Engine: yt-dlp HLS\n"
-                            f"┖ Mode: {mode.upper()}"
-                        )
-                    except Exception:
-                        pass
-        await proc.wait()
-    except Exception as e:
-        logger.exception(f"xh dl err: {e}")
-        try: proc.kill()
-        except Exception: pass
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        last_edit = 0
+        speed = "0 KiB/s"; eta_s = "--:--"; pct = 0.0; total_bytes = 0; downloaded_bytes = 0
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="ignore").strip()
+                m = re.search(r"\[download\]\s+([\d.]+)%", decoded)
+                if m:
+                    pct = float(m.group(1))
+                    ms = re.search(r"([\d.]+[KMG]i?B/s)", decoded)
+                    if ms: speed = ms.group(1)
+                    me = re.search(r"ETA\s+([\d:]+)", decoded)
+                    if me: eta_s = me.group(1)
+                    mz = re.search(r"of\s+~?\s*([\d.]+\s*[KMG]?i?B)", decoded)
+                    if mz:
+                        _t = mz.group(1)
+                        try:
+                            # parse to bytes roughly
+                            unit_map = {"B":1,"K":1024,"KI":1024,"KB":1024,"M":1024**2,"MI":1024**2,"MB":1024**2,
+                                        "G":1024**3,"GI":1024**3,"GB":1024**3,"T":1024**4,"TI":1024**4,"TB":1024**4}
+                            val = float(re.search(r"([\d.]+)", _t).group(1))
+                            u = re.sub(r"[\d.\s]", "", _t).upper()
+                            total_bytes = int(val * unit_map.get(u, 1))
+                            downloaded_bytes = int((pct/100)*total_bytes)
+                        except Exception:
+                            total_bytes = 0
+                    now = time.time()
+                    if now - last_edit > 3:
+                        last_edit = now
+                        bar = "█"*int(pct//5) + "░"*(20 - int(pct//5))
+                        elapsed = int(now - start_ts)
+                        dl_text = _hb(downloaded_bytes) if downloaded_bytes else f"{pct:.1f}%"
+                        tt_text = _hb(total_bytes) if total_bytes else "??"
+                        try:
+                            await status_msg.edit_text(
+                                f"📥 **Downloading...**\n\n"
+                                f"🎬 {safe_title[:60]}\n"
+                                f"┃ `{bar}` {pct:.1f}%\n"
+                                f"┠ ⚡ Speed: `{speed}`\n"
+                                f"┠ 📦 {dl_text} / {tt_text}\n"
+                                f"┠ ⏳ ETA: `{eta_s}` | ⏱ {elapsed}s\n"
+                                f"┠ 🎬 {height}p | Engine: yt-dlp HLS\n"
+                                f"┖ Mode: {mode.upper()}"
+                            )
+                        except Exception:
+                            pass
+            await proc.wait()
+        except Exception as e:
+            logger.exception(f"xh dl err: {e}")
+            try: proc.kill()
+            except Exception: pass
+    finally:
+        XHAMSTER_DOWNLOAD_SEMAPHORE.release()
 
     # Find final file
     final_file = None
@@ -1520,9 +1531,9 @@ async def _xh_download_and_upload(client, status_msg, user, webpage_url, m3u8_ur
             p = os.path.join(out_dir, f)
             if os.path.isfile(p) and f.startswith(safe_title[:40]):
                 final_file = p; break
-    if proc.returncode != 0 or not final_file:
+    if proc is None or proc.returncode != 0 or not final_file:
         return await status_msg.edit_text(
-            f"❌ **Download failed** (code {proc.returncode})\n\n"
+            f"❌ **Download failed** (code {getattr(proc, 'returncode', 'start-error')})\n\n"
             f"URL: {webpage_url}\n\n"
             f"Try again ya direct link alag quality se download karo."
         )
