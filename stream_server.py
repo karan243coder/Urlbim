@@ -87,7 +87,6 @@ def _player_html(token: str, title: str, dl_url: str) -> str:
     <video controls autoplay playsinline preload="metadata" src="{dl_url}"></video>
     <div class="row">
       <a class="btn" href="{dl_url}" download>⬇️ Download</a>
-      <a class="btn alt" href="{dl_url}" target="_blank">🔗 Direct link</a>
     </div>
     <p class="muted">Powered by Bimbo • Link 1 din baad auto-expire ho jaata hai.</p>
   </div>
