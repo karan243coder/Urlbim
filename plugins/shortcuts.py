@@ -66,7 +66,7 @@ async def tera_shortcut(client: Client, m: Message):
     await m.reply_text(url)
 
 
-@Client.on_message(filters.private & _cmd('m3u8', 'stream'))
+@Client.on_message(filters.private & _cmd('m3u8'))
 async def m3u8_shortcut(client: Client, m: Message):
     parts = (m.text or "").split(None, 1)
     url = parts[1] if len(parts) > 1 else ""
