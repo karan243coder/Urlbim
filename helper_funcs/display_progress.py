@@ -40,6 +40,7 @@ last_edit_time = {}
 last_progress_text = {}
 
 PROGRESS_UPDATE_INTERVAL = 2
+DASHBOARD_UPDATE_INTERVAL = 5
 SPEED_HISTORY_LIMIT = 15
 
 
@@ -313,6 +314,7 @@ def clear_user_message(user_id, message=None):
         return current
     _task_messages.pop(user_id, None)
     _last_progress_update.pop(user_id, None)
+    _progress_flood_until.pop(user_id, None)
     return current
 
 
@@ -348,6 +350,7 @@ async def finalize_user_progress(client, user_id, message=None, delete_if_idle=T
         # message even if a caller still holds an older, recreated Message.
         _task_messages.pop(user_id, None)
         _last_progress_update.pop(user_id, None)
+        _progress_flood_until.pop(user_id, None)
         if delete_if_idle:
             try:
                 await current.delete()
@@ -657,21 +660,28 @@ def status_text(task):
 
 
 _last_progress_update = {}  # user_id -> timestamp
+_progress_flood_until = {}   # user_id -> hard Telegram cooldown timestamp
 
 async def update_user_progress(client, user_id, force=False):
     """Edit exactly one canonical dashboard with race/FloodWait protection."""
     from pyrogram.errors import FloodWait
 
     now = time.time()
+    # A Telegram FloodWait is a hard cooldown. Even stage-changing force=True
+    # refreshes must respect it or every concurrent task retries too early.
+    if now < _progress_flood_until.get(user_id, 0):
+        return
     last = _last_progress_update.get(user_id, 0)
-    if not force and now - last < 3:
+    if not force and now - last < DASHBOARD_UPDATE_INTERVAL:
         return
 
     async with _progress_lock(user_id):
         # Re-check after waiting for another task's edit to finish.
         now = time.time()
+        if now < _progress_flood_until.get(user_id, 0):
+            return
         last = _last_progress_update.get(user_id, 0)
-        if not force and now - last < 3:
+        if not force and now - last < DASHBOARD_UPDATE_INTERVAL:
             return
 
         message = get_user_message(user_id)
@@ -682,6 +692,7 @@ async def update_user_progress(client, user_id, force=False):
         if not text:
             _task_messages.pop(user_id, None)
             _last_progress_update.pop(user_id, None)
+            _progress_flood_until.pop(user_id, None)
             try:
                 await message.delete()
             except Exception:
@@ -691,10 +702,15 @@ async def update_user_progress(client, user_id, force=False):
         try:
             _last_progress_update[user_id] = now
             await message.edit_text(text)
+            _progress_flood_until.pop(user_id, None)
         except FloodWait as exc:
-            wait_seconds = getattr(exc, 'value', 3)
-            logger.warning("⏳ FloodWait: %ss - progress update paused", wait_seconds)
-            _last_progress_update[user_id] = now + wait_seconds
+            wait_seconds = max(1, int(getattr(exc, 'value', 3)))
+            _progress_flood_until[user_id] = now + wait_seconds + 1
+            _last_progress_update[user_id] = now
+            logger.warning(
+                "⏳ FloodWait: %ss - dashboard hard cooldown enabled",
+                wait_seconds,
+            )
         except Exception as exc:
             error_text = str(exc)
             if (
@@ -715,6 +731,7 @@ async def update_user_progress(client, user_id, force=False):
             # mapping and recreate one once, under the same lock.
             _task_messages.pop(user_id, None)
             _last_progress_update.pop(user_id, None)
+            _progress_flood_until.pop(user_id, None)
             if client is not None:
                 try:
                     replacement = await client.send_message(user_id, text)
@@ -885,6 +902,7 @@ def cleanup_all_progress():
     _task_messages.clear()
     _progress_locks.clear()
     _last_progress_update.clear()
+    _progress_flood_until.clear()
     speed_history.clear()
     last_edit_time.clear()
     last_progress_text.clear()

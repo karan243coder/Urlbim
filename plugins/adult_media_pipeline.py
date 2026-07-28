@@ -343,29 +343,17 @@ async def _download_and_upload_impl(
                 uploaded_before += part_size
                 update_task(task_id, uploaded_before, total_upload, 0, "uploading", "pyrogram")
 
-            # Log upload remains inside the global upload slot, so user + log
-            # transfers can never exceed the configured two upload workers.
-            if Config.BIMBO_LOG_CHANNEL:
-                for index, part in enumerate(parts, 1):
-                    await send_log_media(
-                        bot=client, user=user, file_path=part,
-                        link=webpage_url,
-                        file_name=f"{safe_title} (part {index})" if len(parts) > 1 else safe_title,
-                        media_type=mode,
-                        file_size=os.path.getsize(part), thumbnail=thumb,
-                        duration=duration, width=width, height=video_height,
-                    )
     except Exception as exc:
         await _notify_failure(client, uid, dashboard, task_id, safe_title, exc)
-        _cleanup_workdir()
-        return False
-    finally:
         try:
             if thumb and os.path.exists(str(thumb)):
                 os.remove(thumb)
         except Exception:
             pass
+        _cleanup_workdir()
+        return False
 
+    # User upload is delivered: remove the visible card immediately.
     update_task(task_id, total_upload, total_upload, 0, "completed", "pyrogram")
     remove_task(task_id)
     await finalize_user_progress(client, uid, dashboard, delete_if_idle=True)
@@ -375,12 +363,39 @@ async def _download_and_upload_impl(
     except Exception:
         pass
 
-    # Cleanup only this task's isolated directory.
-    try:
-        import shutil
-        shutil.rmtree(work_dir, ignore_errors=True)
-    except Exception:
-        pass
+    # Log-channel copies are invisible background uploads. They use the shared
+    # upload limiter but do not keep a 100% user card or priority barrier alive.
+    async def _background_log_and_cleanup():
+        log_task_id = f"log_{uid}_{time.time_ns()}"
+        try:
+            if Config.BIMBO_LOG_CHANNEL:
+                async with stage_slot(
+                    "upload", log_task_id, uid, site="log", client=None,
+                    priority=0, notify=False,
+                ):
+                    for index, part in enumerate(parts, 1):
+                        await send_log_media(
+                            bot=client, user=user, file_path=part,
+                            link=webpage_url,
+                            file_name=(
+                                f"{safe_title} (part {index})"
+                                if len(parts) > 1 else safe_title
+                            ),
+                            media_type=mode,
+                            file_size=os.path.getsize(part), thumbnail=thumb,
+                            duration=duration, width=width, height=video_height,
+                        )
+        except Exception:
+            pass
+        finally:
+            try:
+                if thumb and os.path.exists(str(thumb)):
+                    os.remove(thumb)
+            except Exception:
+                pass
+            _cleanup_workdir()
+
+    asyncio.create_task(_background_log_and_cleanup())
     return True
 
 

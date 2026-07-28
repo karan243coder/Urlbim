@@ -1903,8 +1903,16 @@ async def youtube_dl_call_back(bot, update, priority=100):
                 progress_args=(Translation.BIMBO_UPLOAD_START, progress_msg, start_time, file_name, False),
             )
 
-        # Keep the upload stage slot through the optional log-channel transfer.
-        # Task completion/final dashboard cleanup happens after send_log_media.
+        # User-facing upload is complete. Clear its card immediately; the
+        # optional log-channel copy must never keep a 100% UPLOADING card alive.
+        if upload_stage_acquired:
+            await upload_stage_ctx.__aexit__(None, None, None)
+            upload_stage_acquired = False
+        update_task(upload_task_id, file_size, file_size, 0, 'completed', 'pyrogram')
+        remove_task(upload_task_id)
+        await finalize_user_progress(
+            bot, update.from_user.id, progress_msg, delete_if_idle=True
+        )
 
         # DELETE the original message (update.message) if it's different from progress_msg
         if update.message.id != progress_msg.id:
@@ -1946,38 +1954,40 @@ async def youtube_dl_call_back(bot, update, priority=100):
                 pass
         asyncio.create_task(delete_success_msg())
         
-        # Now do log channel upload (wait for completion before cleanup)
-        await send_log_media(
-            bot=bot,
-            user=update.from_user,
-            file_path=file_location,
-            link=original_link,
-            file_name=original_name,
-            media_type=tg_send_type,
-            file_size=file_size,
-            thumbnail=thumbnail,
-            duration=duration,
-            width=width,
-            height=height,
-        )
-
-        if upload_stage_acquired:
-            await upload_stage_ctx.__aexit__(None, None, None)
-            upload_stage_acquired = False
-        update_task(upload_task_id, file_size, file_size, 0, 'completed', 'pyrogram')
-        remove_task(upload_task_id)
-        await finalize_user_progress(
-            bot, update.from_user.id, progress_msg, delete_if_idle=True
-        )
-        
-        # Record download in quota system for real usage tracking
+        # Record user completion now; log copy runs as an invisible background
+        # upload with its own global upload slot.
         from plugins.user_quota import record_user_download
         record_user_download(update.from_user.id, file_size)
 
-        # Cleanup AFTER log upload is complete
-        if thumbnail:
-            asyncio.create_task(clendir(thumbnail))
-        asyncio.create_task(clendir(file_location))
+        async def _background_log_and_cleanup():
+            log_task_id = f"log_{update.from_user.id}_{time.time_ns()}"
+            try:
+                async with stage_slot(
+                    "upload", log_task_id, update.from_user.id,
+                    site="log", client=None, priority=0, notify=False,
+                ):
+                    await send_log_media(
+                        bot=bot,
+                        user=update.from_user,
+                        file_path=file_location,
+                        link=original_link,
+                        file_name=original_name,
+                        media_type=tg_send_type,
+                        file_size=file_size,
+                        thumbnail=thumbnail,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                    )
+            except Exception as log_exc:
+                logger.warning("Background log upload failed: %s", log_exc)
+            finally:
+                if thumbnail:
+                    await clendir(thumbnail)
+                await clendir(file_location)
+
+        asyncio.create_task(_background_log_and_cleanup())
+
 
     except Exception as e:
         asyncio.create_task(clendir(file_location))

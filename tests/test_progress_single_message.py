@@ -1,5 +1,8 @@
 import asyncio
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 from helper_funcs import display_progress as dp
 
@@ -62,6 +65,35 @@ class SingleProgressDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("KOYEB HEALTH", text)
         self.assertIn("\n", text)
         self.assertNotIn("\\n", text)
+
+    async def test_force_refresh_respects_floodwait_hard_cooldown(self):
+        class FakeFloodWait(Exception):
+            def __init__(self, value):
+                self.value = value
+
+        class FloodMessage(FakeMessage):
+            def __init__(self):
+                super().__init__(99)
+                self.calls = 0
+
+            async def edit_text(self, text):
+                self.calls += 1
+                raise FakeFloodWait(34)
+
+        errors = types.ModuleType("pyrogram.errors")
+        errors.FloodWait = FakeFloodWait
+        pyrogram = types.ModuleType("pyrogram")
+        pyrogram.errors = errors
+
+        message = FloodMessage()
+        dp.register_task("flood", 123, "video.mp4", 100, "download", "yt-dlp")
+        dp.update_task("flood", 50, 100, 10, "downloading", "yt-dlp")
+        dp.set_user_message(123, message)
+        with patch.dict(sys.modules, {"pyrogram": pyrogram, "pyrogram.errors": errors}):
+            await dp.update_user_progress(None, 123, force=True)
+            await dp.update_user_progress(None, 123, force=True)
+        self.assertEqual(message.calls, 1)
+        self.assertGreater(dp._progress_flood_until.get(123, 0), 0)
 
     async def test_waiting_task_clears_stale_speed(self):
         dp.register_task("queued", 123, "large.mp4", 100, "download", "yt-dlp")

@@ -249,7 +249,7 @@ async def _refresh_dashboard(client, user_id: int, force=True):
 
 @asynccontextmanager
 async def stage_slot(stage: str, task_id: str, user_id: int, site="media", client=None,
-                     priority=PRIORITY_NORMAL):
+                     priority=PRIORITY_NORMAL, notify=True):
     limiter = DOWNLOAD_STAGE if stage == "download" else UPLOAD_STAGE
     try:
         from helper_funcs.display_progress import get_task, update_task
@@ -264,7 +264,8 @@ async def stage_slot(stage: str, task_id: str, user_id: int, site="media", clien
         )
     except Exception:
         pass
-    await _refresh_dashboard(client, user_id)
+    if notify:
+        await _refresh_dashboard(client, user_id)
 
     await limiter.acquire(task_id, user_id, site, priority=priority)
     try:
@@ -281,11 +282,13 @@ async def stage_slot(stage: str, task_id: str, user_id: int, site="media", clien
             )
         except Exception:
             pass
-        await _refresh_dashboard(client, user_id)
+        if notify:
+            await _refresh_dashboard(client, user_id)
         yield
     finally:
         await limiter.release(task_id)
-        await _refresh_dashboard(client, user_id)
+        if notify:
+            await _refresh_dashboard(client, user_id)
 
 
 def reset_pipeline_runtime():
