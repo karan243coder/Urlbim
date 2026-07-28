@@ -245,7 +245,7 @@ async def menu_cbs(client: Client, c: CallbackQuery):
     elif d == "cloud_menu":
         txt = ("☁️ **Cloud Upload**\n\n"
                "Reply to a file with:\n"
-               "• /gofile — free stream link\n"
+               "• /stream — website video stream link (24h auto-expire)\n"
                "• /mega — upload to Mega (requires creds)\n"
                "• /gdrive — upload to Google Drive (SA creds)\n")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="home")]])
