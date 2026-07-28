@@ -20,6 +20,7 @@
 import asyncio
 import logging
 import mimetypes
+import time
 
 from aiohttp import web
 
@@ -30,6 +31,33 @@ logger = logging.getLogger(__name__)
 
 # 1 MB chunks while piping from Telegram
 CHUNK_SIZE = 1024 * 1024
+
+# Koyeb free = 512MB RAM + 1 shared pyrogram session. Browser ek video ke liye
+# 3-4 parallel range request bhejta hai — agar sab ek saath Telegram se stream
+# karein to session choke ho ke "Broken pipe" aata hai. Isliye ek saath sirf
+# limited streams chalne do; baaki thodi der wait karenge (queue).
+_MAX_CONCURRENT_STREAMS = max(1, int(getattr(Config, "BIMBO_STREAM_MAX_CONCURRENT", 3) or 3))
+_stream_sem = asyncio.Semaphore(_MAX_CONCURRENT_STREAMS)
+
+# get_messages() ka result thodi der cache karo taaki har parallel/seek request
+# pe dobara Telegram na poocha jaye (session pe load kam).
+_msg_cache: dict = {}
+_MSG_CACHE_TTL = 300  # 5 min
+
+
+async def _cached_get_message(client, chat_id: int, msg_id: int):
+    key = (chat_id, msg_id)
+    now = time.time()
+    hit = _msg_cache.get(key)
+    if hit and (now - hit[1]) < _MSG_CACHE_TTL:
+        return hit[0]
+    message = await client.get_messages(chat_id, msg_id)
+    _msg_cache[key] = (message, now)
+    # cache ko chhota rakho
+    if len(_msg_cache) > 256:
+        for k in list(_msg_cache)[:64]:
+            _msg_cache.pop(k, None)
+    return message
 
 
 def _player_html(token: str, title: str, dl_url: str) -> str:
@@ -105,11 +133,14 @@ async def dl_handler(request: web.Request):
 
     client = request.app["bot"]
 
-    # Fetch the message to get an up-to-date media object
+    # Fetch the message (cached) to get an up-to-date media object
     try:
-        message = await client.get_messages(chat_id, msg_id)
+        message = await _cached_get_message(client, chat_id, msg_id)
     except Exception as e:
-        logger.error(f"stream get_messages: {e}")
+        # Broken pipe / connection = temporary, 503 do taaki browser retry kare
+        if "Broken pipe" in str(e) or "Connection" in str(e):
+            return web.Response(status=503, text="Server busy, thodi der me retry hoga.")
+        logger.warning(f"stream get_messages: {e}")
         return web.Response(status=502, text="Source unavailable.")
     if not message or not (message.video or message.document or message.audio or message.animation):
         return web.Response(status=404, text="Media not found.")
@@ -164,30 +195,39 @@ async def dl_handler(request: web.Request):
     first_cut = start - (offset_chunk * CHUNK_SIZE)
     bytes_to_send = length if length is not None else file_size
     sent = 0
-    try:
-        async for chunk in client.stream_media(message, offset=offset_chunk):
-            if first_cut:
-                chunk = chunk[first_cut:]
-                first_cut = 0
-            if bytes_to_send is not None and sent + len(chunk) > bytes_to_send:
-                chunk = chunk[: bytes_to_send - sent]
-            if not chunk:
-                break
-            await resp.write(chunk)
-            sent += len(chunk)
-            if bytes_to_send is not None and sent >= bytes_to_send:
-                break
-    except (ConnectionResetError, ConnectionError, RuntimeError, asyncio.CancelledError):
-        pass  # client closed the tab / seeked — bilkul normal
-    except Exception as e:
-        # Sirf real errors log karo; disconnect wale nahi
-        if "closing transport" not in str(e) and "Connection" not in str(e):
-            logger.error(f"stream pipe: {e}")
-    finally:
+    # Semaphore: ek saath sirf N streams. Baaki yahan wait karenge — isse
+    # session choke nahi hota aur Broken pipe cascade ruk jaata hai.
+    async with _stream_sem:
         try:
-            await resp.write_eof()
-        except Exception:
+            async for chunk in client.stream_media(message, offset=offset_chunk):
+                if first_cut:
+                    chunk = chunk[first_cut:]
+                    first_cut = 0
+                if bytes_to_send is not None and sent + len(chunk) > bytes_to_send:
+                    chunk = chunk[: bytes_to_send - sent]
+                if not chunk:
+                    break
+                try:
+                    await resp.write(chunk)
+                except (ConnectionError, ConnectionResetError, RuntimeError):
+                    break  # browser disconnected — chup-chaap ruk jao
+                sent += len(chunk)
+                if bytes_to_send is not None and sent >= bytes_to_send:
+                    break
+        except (ConnectionResetError, ConnectionError, RuntimeError, asyncio.CancelledError):
+            pass  # client closed the tab / seeked — bilkul normal
+        except OSError:
+            # [Errno 32] Broken pipe etc — Telegram/client disconnect, ignore
             pass
+        except Exception as e:
+            s = str(e)
+            if "closing transport" not in s and "Connection" not in s and "Broken pipe" not in s:
+                logger.warning(f"stream pipe: {e}")
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
     return resp
 
 
@@ -216,6 +256,11 @@ async def start_stream_server(bot, port: int):
     # har client disconnect). Sirf warnings+ dikhao.
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
     logging.getLogger("aiohttp.server").setLevel(logging.CRITICAL)
+    # asyncio ka "socket.send() raised exception" spam band karo (ye sirf
+    # disconnected clients ke liye aata hai, koi asli error nahi).
+    logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+    # pyrogram session ka "Retrying ... Broken pipe" spam kam karo.
+    logging.getLogger("pyrogram.session.session").setLevel(logging.ERROR)
 
     app = web.Application()
     app["bot"] = bot
