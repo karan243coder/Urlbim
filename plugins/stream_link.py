@@ -143,8 +143,8 @@ async def cmd_stream(client, message):
             "✅ **Stream link ready!**\n\n"
             f"📁 **File:** `{file_name}`\n"
             f"📦 **Size:** {humanbytes(file_size) if file_size else 'N/A'}\n\n"
-            f"▶️ **Watch/Stream:** {watch_url}\n"
-            f"⬇️ **Download:** {dl_url}\n\n"
+            f"▶️ **Watch/Stream:** {watch_url}\n\n"
+            f"💡 Download karna ho to website pe niche **Download** button hai.\n"
             f"⏳ Ye link **{ttl} ghante** baad auto-delete/expire ho jaayega."
         )
         await msg.edit_text(text, disable_web_page_preview=False)
