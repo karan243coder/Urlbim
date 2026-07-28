@@ -723,11 +723,35 @@ async def youtube_dl_call_back(bot, update, priority=100):
         ref = sxyprn_headers.get("Referer")
         if ref:
             hdr_args += ["--add-header", f"Referer:{ref}"]
-        
-        # Naye yt-dlp ne sxyprn ko "[Piracy] not supported" bolke block kar
-        # diya hai. Hum already asli CDN URL nikal chuke hain, isliye yt-dlp ke
-        # site-extractor ki zaroorat hi nahi — generic extractor use karo jo
-        # bypass kar deta hai aur seedha CDN file download karta hai.
+
+        # sxyprn ka cdn8/... URL ek redirect deta hai (-> trafficdeposit.com).
+        # Agar yt-dlp ko redirect wala URL do, to wo redirect ke baad file ko
+        # galat "fmp4" samajh ke sirf ~30 bytes download karta hai (video nahi
+        # aati). Fix: redirect ko yahin resolve karke ASLI final URL yt-dlp ko
+        # do — tab wo poori file theek download karta hai.
+        try:
+            import requests as _rq
+            _ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            _hdrs = {"User-Agent": _ua}
+            if ref:
+                _hdrs["Referer"] = ref
+            _r = await asyncio.to_thread(
+                _rq.get, video_url, headers=_hdrs, timeout=30,
+                allow_redirects=True, stream=True,
+            )
+            resolved = _r.url or video_url
+            try:
+                _r.close()
+            except Exception:
+                pass
+            if resolved and resolved != video_url:
+                logger.info("sxyprn: resolved redirect -> %s", resolved[:80])
+                video_url = resolved
+        except Exception as e:
+            logger.warning("sxyprn redirect resolve failed, using original: %s", e)
+
+        # Resolved URL direct file hai (no redirect) — generic extractor se
+        # yt-dlp poori file download karega. Piracy-block bhi bypass rahega.
         command_to_exec = (
             common_ytdlp_args + hdr_args
             + ["--force-generic-extractor", "-o", download_directory, video_url]
