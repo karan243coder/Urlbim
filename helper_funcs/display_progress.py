@@ -616,7 +616,7 @@ async def build_advanced_progress_text(user_id):
 
     stats = get_system_stats_advanced()
     text += (
-        "\n🖥️ **KOYEB HEALTH**\n"
+        "\n🖥️ **SYSTEM HEALTH**\n"
         f"CPU `{stats['cpu']:.0f}%`  •  RAM `{stats['ram']:.0f}%`"
         f"  •  Free `{humanbytes(stats['disk_free'])}`\n"
         f"Net ⬇️ `{format_speed(stats['total_dl_speed'])}`"
