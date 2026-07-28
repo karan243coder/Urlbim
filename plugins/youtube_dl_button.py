@@ -724,7 +724,14 @@ async def youtube_dl_call_back(bot, update, priority=100):
         if ref:
             hdr_args += ["--add-header", f"Referer:{ref}"]
         
-        command_to_exec = common_ytdlp_args + hdr_args + ["-o", download_directory, video_url]
+        # Naye yt-dlp ne sxyprn ko "[Piracy] not supported" bolke block kar
+        # diya hai. Hum already asli CDN URL nikal chuke hain, isliye yt-dlp ke
+        # site-extractor ki zaroorat hi nahi — generic extractor use karo jo
+        # bypass kar deta hai aur seedha CDN file download karta hai.
+        command_to_exec = (
+            common_ytdlp_args + hdr_args
+            + ["--force-generic-extractor", "-o", download_directory, video_url]
+        )
     
     # Pornhub Handler
     elif response_json.get("_pornhub") and youtube_dl_format.startswith("ph-"):
