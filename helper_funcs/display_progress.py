@@ -72,16 +72,11 @@ ENGINE_COLORS = {
 def register_task(task_id, user_id, filename="Unknown", total_size=0, 
                   task_type="download", engine="pyrogram", source_url=""):
     """Naya task register karo tracker mein"""
-    # DUPLICATE CHECK: Same user ka same filename wala task already active hai to skip karo
-    existing_tasks = get_user_active_tasks(user_id)
-    for existing in existing_tasks:
-        # Same filename + same task_type = duplicate
-        if (existing.get('filename') == filename and 
-            existing.get('task_type') == task_type and
-            existing.get('id') != task_id):
-            logger.info(f"Duplicate task skipped: {filename} (type={task_type}) already active for user {user_id}")
-            return existing
-    
+    # task_id is the identity. Two profile videos can legitimately have the
+    # same title/filename, so filename-based de-duplication would drop jobs.
+    if task_id in _task_store:
+        return _task_store[task_id]
+
     task = {
         'id': task_id,
         'user_id': user_id,
@@ -99,6 +94,7 @@ def register_task(task_id, user_id, filename="Unknown", total_size=0,
         'eta': 0,
         'elapsed': 0,
         'error': None,
+        'detail': '',
         'completed': False,
         'speed_samples': [],
         'last_update': time.time(),
@@ -161,6 +157,39 @@ def update_task(task_id, downloaded, total_size=0, speed=0, status=None, engine=
 
 def get_task(task_id):
     return _task_store.get(task_id)
+
+
+def set_task_stage(task_id, task_type=None, status=None, engine=None,
+                   downloaded=None, total_size=None, reset_timer=False,
+                   detail=None):
+    """Change download → processing/upload without creating a second card."""
+    task = _task_store.get(task_id)
+    if not task:
+        return None
+    if task_type:
+        task['task_type'] = task_type
+    if status:
+        task['status'] = status
+    if engine:
+        task['engine'] = engine
+    if detail is not None:
+        task['detail'] = str(detail)[:160]
+    if downloaded is not None:
+        task['downloaded'] = max(0, int(downloaded))
+    if total_size is not None:
+        task['total_size'] = max(0, int(total_size))
+    if reset_timer:
+        task['start_time'] = time.time()
+        task['elapsed'] = 0
+        task['speed'] = 0
+        task['avg_speed'] = 0
+        task['speed_samples'].clear()
+    if task['total_size'] > 0:
+        task['percentage'] = min(100, task['downloaded'] / task['total_size'] * 100)
+    else:
+        task['percentage'] = 0
+    task['last_update'] = time.time()
+    return task
 
 
 def remove_task(task_id):
@@ -296,7 +325,13 @@ async def finalize_user_progress(client, user_id, message=None, delete_if_idle=T
     async with _progress_lock(user_id):
         current = _task_messages.get(user_id)
         active = get_user_active_tasks(user_id)
-        if active:
+        pipeline_pending = 0
+        try:
+            from plugins.media_pipeline import get_pipeline_stats
+            pipeline_pending = get_pipeline_stats(user_id).get('total_pending', 0)
+        except Exception:
+            pass
+        if active or pipeline_pending:
             if current is not None:
                 try:
                     text = await build_advanced_progress_text(user_id)
@@ -429,7 +464,9 @@ def get_status_emoji(status):
         'queued': '⏳',
         'waiting': '⏸️',
         'downloading': '📥',
-        'uploading': '📤', 
+        'uploading': '📤',
+        'processing': '⚙️',
+        'splitting': '✂️',
         'completed': '✅',
         'failed': '❌',
         'cancelled': '🚫',
@@ -453,9 +490,13 @@ def get_system_stats_advanced():
         # Memory bar
         mem_bar = "█" * int(mem.percent/10) + "░" * (10 - int(mem.percent/10))
         
-        # Active tasks count
-        active_count = sum(1 for t in _task_store.values() if not t['completed'])
-        total_count = len(_task_store)
+        # Active means actually consuming a stage slot. Queued/waiting jobs are
+        # reported separately by the unified media pipeline footer.
+        active_count = sum(
+            1 for t in _task_store.values()
+            if not t['completed'] and t.get('status') not in ('queued', 'waiting')
+        )
+        total_count = sum(1 for t in _task_store.values() if not t['completed'])
         
         # Total speeds
         total_dl = sum(t.get('avg_speed', 0) for t in _task_store.values() 
@@ -489,111 +530,105 @@ def get_system_stats_advanced():
 # ===================== MAIN PROGRESS BUILDER =====================
 
 async def build_advanced_progress_text(user_id):
-    """
-    **THE ULTIMATE PROGRESS UI** 🔥
-    
-    Multiple tasks ke saath ek hi message mein dikhega:
-    
-    ╔══════════════════════════════════╗
-    ║        BIMBO PROGRESS            ║
-    ╚══════════════════════════════════╝
-    
-    📥 TASK 1: video.mp4
-    ┌─────────────────────────────┐
-    │ [████████░░░░░░] 67.3%     │
-    │ ⚡ Speed : 2.4MB/s         │
-    │ 📦 Done  : 156.2MB/256MB   │
-    │ ⏱️ ETA   : 42s             │
-    │ 🎬 Engine: yt-dlp          │
-    │ 📊 Status: ✅ Downloading  │
-    └─────────────────────────────┘
-    
-    📤 TASK 2: file.zip
-    ┌─────────────────────────────┐
-    │ [████████████] 100%        │
-    │ ⚡ Speed : 5.1MB/s         │
-    │ 📦 Done  : 1.2GB/1.2GB    │
-    │ 🎬 Engine: ⚡Aria2          │
-    │ 📊 Status: ✅ Completed    │
-    └─────────────────────────────┘
-    
-    ═══════════════════════════════════
-    🖥️ SYSTEM STATS
-    ├ 🧠 CPU : [████░░░░░░] 45.2%
-    ├ 💾 RAM : [███░░░░░░░] 35.1%
-    ├ 💿 Disk: Free: 16.1GB (78%)
-    └ ⏱️ Uptime: 12d 15h 32m
-    
-    📊 NETWORK
-    ├ ⬇️ DL : 2.4MB/s
-    └ ⬆️ UL : 733KB/s
-    ═══════════════════════════════════
-    """
-    
-    tasks = get_user_active_tasks(user_id)
+    """Premium compact, mobile-first, single-message live dashboard."""
+    user_tasks = get_user_active_tasks(user_id)
     all_tasks = get_user_all_tasks(user_id)
-    
-    if not all_tasks:
+
+    running_tasks = [
+        task for task in user_tasks
+        if task.get('status') not in ('queued', 'waiting')
+    ]
+    waiting_tasks = [
+        task for task in user_tasks
+        if task.get('status') in ('queued', 'waiting')
+    ]
+    tasks = running_tasks[:4]
+    if not tasks and waiting_tasks:
+        tasks = waiting_tasks[:1]
+
+    try:
+        from plugins.media_pipeline import get_pipeline_stats
+        mine = get_pipeline_stats(user_id)
+        global_q = get_pipeline_stats()
+    except Exception:
+        mine = global_q = {
+            'download_active': 0, 'download_waiting': 0, 'download_limit': 2,
+            'upload_active': 0, 'upload_waiting': 0, 'upload_limit': 2,
+            'bulk_pending': 0, 'interactive': 0, 'total_pending': 0,
+        }
+
+    if not all_tasks and mine.get('total_pending', 0) <= 0:
         return None
-    
-    # ===== HEADER =====
-    text = "╔════════════════════════════════════╗\n"
-    text += "║        📊 **BIMBO PROGRESS**        ║\n"
-    text += "╚════════════════════════════════════╝\n\n"
-    
-    # ===== TASKS =====
-    for i, task in enumerate(tasks, 1):
-        name = trim_text(task['filename'], 30)
-        pct = task['percentage']
-        bar = build_advanced_bar(pct)
-        transferred = humanbytes(task['downloaded'])
-        total = humanbytes(task['total_size']) if task['total_size'] > 0 else "?"
-        spd = format_speed(task['avg_speed'])
-        eta = format_time(task['eta'])
-        elapsed = format_time(task['elapsed'])
-        engine_icon = ENGINE_ICONS.get(task['engine'], task['engine'])
-        status_emoji = get_status_emoji(task['status'])
-        speed_indicator = get_speed_indicator(task['avg_speed'])
-        task_type_emoji = "📥" if task['task_type'] == 'download' else "📤"
-        task_type_name = "DOWNLOAD" if task['task_type'] == 'download' else "UPLOAD"
-        
-        # Task box
-        text += f"**{task_type_emoji} TASK {i}: `{name}`**\n"
-        text += "┌─────────────────────────────┐\n"
-        text += f"│ {bar} {pct:.1f}%\n"
-        text += f"│ {speed_indicator} **Speed:** {spd}\n"
-        text += f"│ 📦 **Done:** {transferred} / {total}\n"
-        text += f"│ ⏱️ **ETA:** {eta} | **Elapsed:** {elapsed}\n"
-        text += f"│ 🎬 **Engine:** {engine_icon}\n"
-        text += f"│ 📊 **Status:** {status_emoji} {status_text(task)}\n"
-        text += "└─────────────────────────────┘\n\n"
-    
-    # ===== COMPLETED TASKS SUMMARY =====
-    completed = [t for t in all_tasks if t['completed']]
-    if completed:
-        text += "**✅ Completed Tasks:**\n"
-        for t in completed[-3:]:  # Last 3
-            text += f"├ {trim_text(t['filename'], 25)} - {humanbytes(t['total_size'])}\n"
-        text += "└─────────────────────────────\n\n"
-    
-    # ===== NO TASKS =====
-    if not tasks and not completed:
-        text += "ℹ️ **No active tasks.**\nSend a link to start!\n\n"
-    
-    # ===== SYSTEM STATS =====
+
+    active_now = len(running_tasks)
+    text = (
+        f"⚡ **BIMBO LIVE**  •  `{active_now} active`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    for index, task in enumerate(tasks, 1):
+        is_upload = task.get('task_type') == 'upload'
+        stage_icon = '⬆️' if is_upload else '⬇️'
+        stage_name = 'UPLOAD' if is_upload else 'DOWNLOAD'
+        name = trim_text(task.get('filename'), 29)
+        pct = max(0.0, min(100.0, float(task.get('percentage', 0))))
+        bar_width = 12
+        filled = int(bar_width * pct / 100)
+        bar = '▰' * filled + '▱' * (bar_width - filled)
+        done = humanbytes(task.get('downloaded', 0))
+        total = humanbytes(task.get('total_size', 0)) if task.get('total_size', 0) else '?'
+        speed = format_speed(task.get('avg_speed', 0))
+        eta = format_time(task.get('eta', 0))
+        elapsed = format_time(task.get('elapsed', 0))
+        engine = ENGINE_ICONS.get(task.get('engine'), task.get('engine', 'unknown'))
+        status = task.get('status', 'queued')
+
+        text += f"\n{stage_icon} **{index} · {stage_name}**\n"
+        text += f"`{name}`\n"
+        text += f"`{bar}`  **{pct:.1f}%**\n"
+        if status in ('queued', 'waiting'):
+            text += f"⏳ {status_text(task)}\n"
+        else:
+            text += f"📦 {done} / {total}  •  ⚡ {speed}\n"
+            text += f"⏱ {eta} left  •  🕒 {elapsed}\n"
+        detail = trim_text(task.get('detail', ''), 42)
+        if detail:
+            text += f"🔄 {detail}\n"
+        text += f"{engine}  •  {get_status_emoji(status)} `{status.upper()}`\n"
+
+    hidden = max(0, len(user_tasks) - len(tasks))
+    if hidden:
+        text += f"\n⏳ **+{hidden} task(s) queued below**\n"
+
+    text += (
+        "\n🧭 **PIPELINE QUEUE**\n"
+        f"⬇️ DL  `{global_q['download_active']}/{global_q['download_limit']}`"
+        f"  •  wait `{global_q['download_waiting']}`\n"
+        f"⬆️ UL  `{global_q['upload_active']}/{global_q['upload_limit']}`"
+        f"  •  wait `{global_q['upload_waiting']}`\n"
+        f"📚 Bulk left `{global_q['bulk_pending']}`"
+        f"  •  👤 Yours `{mine['total_pending']}`\n"
+        f"🚀 Priority jobs `{global_q.get('interactive', 0)}`\n"
+    )
+
     stats = get_system_stats_advanced()
-    
-    text += "═" * 32 + "\n"
-    text += f"🖥️ **SYSTEM** │ ⏱️ {stats['uptime']}\n"
-    text += f"├ 🧠 **CPU:** `[{stats['cpu_bar']}]` {stats['cpu']:.1f}%\n"
-    text += f"├ 💾 **RAM:** `[{stats['ram_bar']}]` {stats['ram']:.1f}%\n"
-    text += f"│ └ {humanbytes(stats['ram_used'])} / {humanbytes(stats['ram_total'])}\n"
-    text += f"├ 💿 **Disk:** Free {humanbytes(stats['disk_free'])} ({100-stats['disk_percent']:.0f}%)\n"
-    text += f"├ 📊 **Tasks:** {stats['active_tasks']} active / {stats['total_tasks']} total\n"
-    text += f"├ ⬇️ **DL:** {format_speed(stats['total_dl_speed'])}\n"
-    text += f"└ ⬆️ **UL:** {format_speed(stats['total_ul_speed'])}\n"
-    text += "═" * 32
-    
+    text += (
+        "\n🖥️ **KOYEB HEALTH**\n"
+        f"CPU `{stats['cpu']:.0f}%`  •  RAM `{stats['ram']:.0f}%`"
+        f"  •  Free `{humanbytes(stats['disk_free'])}`\n"
+        f"Net ⬇️ `{format_speed(stats['total_dl_speed'])}`"
+        f"  ⬆️ `{format_speed(stats['total_ul_speed'])}`\n"
+    )
+    warnings = []
+    if stats['ram'] >= 85:
+        warnings.append('High RAM')
+    if stats['disk_free'] and stats['disk_free'] < 2 * 1024**3:
+        warnings.append('Low disk')
+    if stats['cpu'] >= 90:
+        warnings.append('High CPU')
+    if warnings:
+        text += f"⚠️ **{' • '.join(warnings)}**\n"
+    text += "━━━━━━━━━━━━━━━━━━━━"
     return text
 
 
@@ -606,6 +641,10 @@ def status_text(task):
         return "⏸️ Waiting for safe download slot..."
     elif s == 'uploading':
         return "⬆️ Uploading..."
+    elif s == 'processing':
+        return "⚙️ Processing..."
+    elif s == 'splitting':
+        return "✂️ Splitting large file..."
     elif s == 'queued':
         return "⏳ Queued..."
     elif s == 'completed':

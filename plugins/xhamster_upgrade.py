@@ -44,7 +44,7 @@ from utils import (
     is_admin, is_premium, rate_limit_check, get_url,
 )
 from database.xhamster_queue import create_job, get_job, claim_next_item, finish_item, update_job, cancel_job, pause_job, resume_job
-from plugins.xhamster_runtime import XHAMSTER_DOWNLOAD_SEMAPHORE
+from plugins.media_pipeline import set_bulk_backlog, clear_bulk_backlog
 from plugins.xhamster_engine import (
     is_xhamster, _extract_window_initials, _clean_xhamster_page_url,
     _base_of, UA, QLABEL, extract as xh_extract, _normalize_html_for_urls,
@@ -906,7 +906,7 @@ async def _safe_answer(c: CallbackQuery, text: str = "", show_alert: bool = Fals
         pass
 
 
-# Shared stream limiter is imported from plugins.xhamster_runtime.
+ # xHamster site limit is enforced by plugins.media_pipeline.
 
 
 async def _xh_fetch_qualities_for_item(item, session: aiohttp.ClientSession):
@@ -991,31 +991,43 @@ async def _xh_full_queue_worker(client, job_id, user, status_msg):
             item = await claim_next_item(job_id)
             if not item:
                 await update_job(job_id, status="completed")
-                try: await status_msg.edit_text(f"✅ Full channel queue complete\n\nDone: {completed} | Failed: {failed}")
-                except Exception: pass
+                clear_bulk_backlog(job_id)
+                try:
+                    done_msg = await client.send_message(
+                        status_msg.chat.id,
+                        f"✅ Full channel queue complete\n\nDone: {completed} | Failed: {failed}",
+                    )
+                    asyncio.create_task(_auto_delete(done_msg, delay=15))
+                except Exception:
+                    pass
                 return
             idx = item.get("index", 0) + 1
             title = item.get("title", "Video")
             current_job = await get_job(job_id)
             total = len((current_job or {}).get("items", []))
-            try:
-                await status_msg.edit_text(f"📥 Full channel queue\n\n🔽 {idx}/{total} processing\n🎬 {title[:70]}\n✅ Done: {completed} | ❌ Failed: {failed}\n📋 Total videos: {total}")
-            except Exception: pass
-            # Reuse the stable existing downloader; quality extraction is per item.
+            pending = sum(
+                1 for queued_item in (current_job or {}).get("items", [])
+                if queued_item.get("status") == "pending"
+            )
+            set_bulk_backlog(
+                job_id, user.id, pending, site="xhamster",
+                label=(current_job or {}).get("title", "xHamster Channel"),
+            )
+            # Reuse the unified downloader; no per-video Telegram progress message.
             async with aiohttp.ClientSession() as session:
                 h, m3u8, final_url = await _xh_fetch_qualities_for_item(item, session)
-            prog = await client.send_message(status_msg.chat.id, f"🔽 #{idx} downloading: {title[:60]}")
             try:
-                # Never allow one stuck yt-dlp/ffmpeg/upload job to block the
-                # entire channel queue. Timeout is configurable through the
-                # existing process-timeout environment variable.
-                await asyncio.wait_for(
+                # The one canonical dashboard is reused for every item.
+                ok = await asyncio.wait_for(
                     _xh_download_and_upload(
-                        client, prog, user, final_url, m3u8, title, h, "video",
-                        {"User-Agent": UA, "Referer": final_url, "Origin": _base_of(final_url)}
+                        client, status_msg, user, final_url, m3u8, title, h, "video",
+                        {"User-Agent": UA, "Referer": final_url, "Origin": _base_of(final_url)},
+                        priority=0,
                     ),
                     timeout=max(300, int(Config.BIMBO_PROCESS_MAX_TIMEOUT))
                 )
+                if not ok:
+                    raise RuntimeError("media pipeline failed")
                 await finish_item(job_id, item["index"], "completed")
                 completed += 1
             except asyncio.TimeoutError:
@@ -1032,10 +1044,17 @@ async def _xh_full_queue_worker(client, job_id, user, status_msg):
             gc.collect()
             await asyncio.sleep(10)
     except Exception as exc:
+        clear_bulk_backlog(job_id)
         await update_job(job_id, status="paused", last_error=str(exc)[:500])
         logger.exception("xh full queue worker stopped")
-        try: await status_msg.edit_text(f"⚠️ Queue paused safely\nDone: {completed} | Failed: {failed}\nError: {str(exc)[:300]}")
-        except Exception: pass
+        try:
+            await client.send_message(
+                status_msg.chat.id,
+                f"⚠️ Queue paused safely\nDone: {completed} | Failed: {failed}\n"
+                f"Error: {str(exc)[:300]}",
+            )
+        except Exception:
+            pass
 
 
 @Client.on_callback_query(filters.regex(r"^xh_(q|pg|vid|back|dl|best|album|all|pageall|prevpg|sort)::"))
@@ -1070,7 +1089,15 @@ async def xh_callbacks(client: Client, c: CallbackQuery):
                 if not all_items:
                     return await status_msg.edit_text("❌ No videos found for queue.")
                 job_id = await create_job(c.from_user.id, c.message.chat.id, entry.get("title", "xHamster Channel"), entry.get("current_url", ""), all_items)
-                await status_msg.edit_text(f"✅ Queue created\n\n📋 Videos: {len(all_items)}\n⚡ Mode: 1-by-1\n📦 Max quality\n🔁 Restart-safe queue")
+                set_bulk_backlog(
+                    job_id, c.from_user.id, len(all_items), site="xhamster",
+                    label=entry.get("title", "xHamster Channel"),
+                )
+                await status_msg.edit_text(
+                    f"✅ Added to unified queue\n\n📋 Videos: {len(all_items)}\n"
+                    f"⬇️ Global download slots: 2\n⬆️ Global upload slots: 2\n"
+                    f"🧭 Fair FIFO enabled"
+                )
                 asyncio.create_task(_xh_full_queue_worker(client, job_id, c.from_user, status_msg))
             except Exception as exc:
                 logger.exception("xh full queue create failed")
@@ -1083,7 +1110,7 @@ async def xh_callbacks(client: Client, c: CallbackQuery):
             entry = _LISTING_STORE.get(token)
             if not entry:
                 return await _safe_answer(c, "Session expired", show_alert=True)
-            items = entry.get("items", [])[:8]
+            items = entry.get("items", [])[:10]
             if not items:
                 return await _safe_answer(c, "No videos", show_alert=True)
 
@@ -1126,43 +1153,22 @@ async def xh_callbacks(client: Client, c: CallbackQuery):
             async def _run_one(job):
                 item = job["item"]
                 title = item.get("title", "Video")
-                i = job["idx"]
                 url = job["final_url"]
                 best_h = job["best_h"]
                 best_m3u8 = job["best_m3u8"]
-                try:
-                    prog_msg = await client.send_message(
-                        c.message.chat.id,
-                        f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}...",
-                        reply_to_message_id=c.message.id,
-                    )
-                except Exception:
-                    try:
-                        prog_msg = await c.message.reply_text(
-                            f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}..."
-                        )
-                    except Exception as e:
-                        logger.warning(f"xh all send prog fail: {e}")
-                        return
                 await _xh_download_and_upload(
-                    client, prog_msg, c.from_user, url, best_m3u8, title, best_h, "video",
-                    {"User-Agent": UA, "Referer": url, "Origin": _base_of(url)}
+                    client, status_msg, c.from_user, url, best_m3u8, title, best_h, "video",
+                    {"User-Agent": UA, "Referer": url, "Origin": _base_of(url)},
+                    priority=0,
                 )
 
             for job in download_jobs:
                 asyncio.create_task(_run_one(job))
                 await asyncio.sleep(1)  # small stagger between starts
 
-            try:
-                await status_msg.edit_text(
-                    f"✅ **Download All Started!**\n\n"
-                    f"📥 {len(items)} videos queue me hain (best quality per video).\n"
-                    f"⚡ One safe xHamster stream at a time (429 protection).\n"
-                    f"Har video alag progress bar ke saath ayegi..."
-                )
-            except Exception:
-                pass
-            asyncio.create_task(_auto_delete(status_msg, delay=20))
+            await _safe_answer(
+                c, f"{len(items)} videos unified queue me add hue", show_alert=True
+            )
             return
 
         # ---------- SORT CURRENT PAGE ----------
@@ -1410,340 +1416,24 @@ async def xh_callbacks(client: Client, c: CallbackQuery):
 
 
 # ================== DIRECT XHAMSTER DOWNLOAD + UPLOAD ==================
-async def _xh_download_and_upload(client, status_msg, user, webpage_url, m3u8_url, title, height, mode, headers):
-    """Download xHamster HLS with yt-dlp, then upload to Telegram with progress."""
-    from helper_funcs.display_progress import progress_for_pyrogram, humanbytes as _hb, TimeFormatter as _TF
-    from plugins.custom_thumbnail import Gthumb01, Gthumb02, Mdata01, Mdata03, get_flocation
-    from plugins.youtube_dl_button import send_log_media
-    from pyrogram import enums
-    uid = user.id
-    out_dir = user_download_dir(uid)
-    os.makedirs(out_dir, exist_ok=True)
-    ts = int(time.time())
-    safe_title = re.sub(r'[\\/:*?"<>|]+', ' ', title)[:100].strip() or "xhamster_video"
-    if mode == "audio":
-        out_path = os.path.join(out_dir, f"{safe_title}_{ts}.mp3")
-    else:
-        out_path = os.path.join(out_dir, f"{safe_title}_{height}p_{ts}.mp4")
-
-    # Build yt-dlp command
-    cmd = [
-        "yt-dlp", "--no-warnings", "-c", "--newline",
-        "--no-check-certificates", "--geo-bypass",
-        "--buffer-size", "8M", "--http-chunk-size", "4M",
-        "--retries", "20", "--fragment-retries", "20",
-        "--retry-sleep", "http:exp=2:20",
-        "--retry-sleep", "fragment:exp=2:20",
-        "--concurrent-fragments", str(Config.XHAMSTER_CONCURRENT_FRAGMENTS),
-        "--add-header", f"User-Agent:{UA}",
-    ]
-    if Config.BIMBO_HTTP_PROXY:
-        cmd += ["--proxy", Config.BIMBO_HTTP_PROXY]
-    if headers.get("Referer"):
-        cmd += ["--add-header", f"Referer:{headers['Referer']}"]
-    if headers.get("Origin"):
-        cmd += ["--add-header", f"Origin:{headers['Origin']}"]
-    if Config.XHAMSTER_USE_COOKIES and os.path.exists("cookies.txt"):
-        cmd += ["--cookies", "cookies.txt"]
-    if mode == "audio":
-        cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "192K", "--hls-prefer-native", "-o", out_path]
-    else:
-        cmd += ["--hls-prefer-native", "--merge-output-format", "mp4", "-o", out_path]
-    target_url = m3u8_url or webpage_url
-    cmd.append(target_url)
-
-    if XHAMSTER_DOWNLOAD_SEMAPHORE.locked():
-        try:
-            await status_msg.edit_text(
-                "⏳ **Queued safely** — another xHamster download is active."
-            )
-        except Exception:
-            pass
-    await XHAMSTER_DOWNLOAD_SEMAPHORE.acquire()
-    proc = None
-    start_ts = time.time()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-        )
-        last_edit = 0
-        speed = "0 KiB/s"; eta_s = "--:--"; pct = 0.0; total_bytes = 0; downloaded_bytes = 0
-        try:
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                decoded = line.decode("utf-8", errors="ignore").strip()
-                m = re.search(r"\[download\]\s+([\d.]+)%", decoded)
-                if m:
-                    pct = float(m.group(1))
-                    ms = re.search(r"([\d.]+[KMG]i?B/s)", decoded)
-                    if ms: speed = ms.group(1)
-                    me = re.search(r"ETA\s+([\d:]+)", decoded)
-                    if me: eta_s = me.group(1)
-                    mz = re.search(r"of\s+~?\s*([\d.]+\s*[KMG]?i?B)", decoded)
-                    if mz:
-                        _t = mz.group(1)
-                        try:
-                            # parse to bytes roughly
-                            unit_map = {"B":1,"K":1024,"KI":1024,"KB":1024,"M":1024**2,"MI":1024**2,"MB":1024**2,
-                                        "G":1024**3,"GI":1024**3,"GB":1024**3,"T":1024**4,"TI":1024**4,"TB":1024**4}
-                            val = float(re.search(r"([\d.]+)", _t).group(1))
-                            u = re.sub(r"[\d.\s]", "", _t).upper()
-                            total_bytes = int(val * unit_map.get(u, 1))
-                            downloaded_bytes = int((pct/100)*total_bytes)
-                        except Exception:
-                            total_bytes = 0
-                    now = time.time()
-                    if now - last_edit > 3:
-                        last_edit = now
-                        bar = "█"*int(pct//5) + "░"*(20 - int(pct//5))
-                        elapsed = int(now - start_ts)
-                        dl_text = _hb(downloaded_bytes) if downloaded_bytes else f"{pct:.1f}%"
-                        tt_text = _hb(total_bytes) if total_bytes else "??"
-                        try:
-                            await status_msg.edit_text(
-                                f"📥 **Downloading...**\n\n"
-                                f"🎬 {safe_title[:60]}\n"
-                                f"┃ `{bar}` {pct:.1f}%\n"
-                                f"┠ ⚡ Speed: `{speed}`\n"
-                                f"┠ 📦 {dl_text} / {tt_text}\n"
-                                f"┠ ⏳ ETA: `{eta_s}` | ⏱ {elapsed}s\n"
-                                f"┠ 🎬 {height}p | Engine: yt-dlp HLS\n"
-                                f"┖ Mode: {mode.upper()}"
-                            )
-                        except Exception:
-                            pass
-            await proc.wait()
-        except Exception as e:
-            logger.exception(f"xh dl err: {e}")
-            try: proc.kill()
-            except Exception: pass
-    finally:
-        XHAMSTER_DOWNLOAD_SEMAPHORE.release()
-
-    # Find final file
-    final_file = None
-    if os.path.exists(out_path):
-        final_file = out_path
-    else:
-        for f in os.listdir(out_dir):
-            p = os.path.join(out_dir, f)
-            if os.path.isfile(p) and f.startswith(safe_title[:40]):
-                final_file = p; break
-    if proc is None or proc.returncode != 0 or not final_file:
-        return await status_msg.edit_text(
-            f"❌ **Download failed** (code {getattr(proc, 'returncode', 'start-error')})\n\n"
-            f"URL: {webpage_url}\n\n"
-            f"Try again ya direct link alag quality se download karo."
-        )
-
-    fsize = os.path.getsize(final_file)
-    elapsed_dl = int(time.time() - start_ts)
-
-    # Telegram limit: 2000 MiB (split at 1900MB for safety)
-    MAX_TG_SIZE = 1900 * 1024 * 1024
-    needs_split = fsize > MAX_TG_SIZE
-    parts_to_upload = [final_file]
-
-    if needs_split:
-        await status_msg.edit_text(
-            f"✂️ **Large File Detected**\n\n"
-            f"🎬 {safe_title[:50]}\n"
-            f"📦 Size: {humanbytes(fsize)} → splitting into parts for Telegram..."
-        )
-        parts_to_upload = await _split_large_video(final_file, MAX_TG_SIZE, status_msg=status_msg)
-        await status_msg.edit_text(
-            f"✅ **Split Complete**\n\n"
-            f"📦 {len(parts_to_upload)} parts ready\n"
-            f"📤 Uploading parts one by one..."
-        )
-    else:
-        await status_msg.edit_text(f"📤 **Uploading to Telegram...**\n\n📦 {humanbytes(fsize)} | ⏱ Downloaded in {elapsed_dl}s")
-
-    try:
-        caption = f"🎬 **{safe_title}**\n📥 {height}p | ⚡ BIMBO"
-
-        # Build a minimal fake update object for thumbnail helpers (Gthumb signature expects update.from_user.id etc.)
-        class FakeFromUser:
-            id = uid; first_name = getattr(user, "first_name", "User"); username = getattr(user, "username", None)
-        class FakeMsgForThumb:
-            from_user = FakeFromUser()
-            id = status_msg.id
-            chat = status_msg.chat
-            message_id = status_msg.id
-        fake_update = FakeMsgForThumb()
-
-        upload_start = time.time()
-        sent_msgs = []
-
-        # Prepare thumbnail once from original file (same thumb for all parts)
-        thumb = None
-        w = h = duration = 0
-        if mode == "audio":
-            duration = await Mdata03(final_file)
-            thumb = await Gthumb01(client, fake_update, task_id=f"xhaudio{ts}")
-        elif mode == "file":
-            thumb = await Gthumb01(client, fake_update, task_id=f"xhfile{ts}")
-        else:
-            w, h, duration = await get_video_whd(final_file)
-            if duration < 1:
-                try:
-                    dur2 = await Mdata01(final_file)
-                    if isinstance(dur2, tuple) and len(dur2) >= 3:
-                        w, h, duration = dur2[:3]
-                except Exception:
-                    pass
-            duration = max(duration or 1, 1)
-            w = w or 0; h = h or 0
-            thumb = await Gthumb02(client, fake_update, duration, final_file, task_id=f"xhvid{ts}")
-
-        total_parts = len(parts_to_upload)
-        for part_idx, part_path in enumerate(parts_to_upload, 1):
-            part_size = os.path.getsize(part_path)
-            part_caption = caption
-            if total_parts > 1:
-                part_caption = f"🎬 **{safe_title}**\n📥 {height}p | Part {part_idx}/{total_parts} | ⚡ BIMBO"
-
-            # Update status for this part
-            try:
-                await status_msg.edit_text(
-                    f"📤 **Uploading...**\n\n"
-                    f"🎬 {safe_title[:45]}\n"
-                    f"📦 Part {part_idx}/{total_parts} | {humanbytes(part_size)}\n"
-                    f"⏱ Elapsed: {int(time.time() - upload_start)}s"
-                )
-            except Exception:
-                pass
-
-            if mode == "audio":
-                sent = await client.send_audio(
-                    status_msg.chat.id, part_path, caption=part_caption,
-                    duration=duration, thumb=thumb,
-                    reply_to_message_id=status_msg.id,
-                    progress=progress_for_pyrogram,
-                    progress_args=(f"Uploading audio {f'(part {part_idx}/{total_parts})' if total_parts>1 else ''}",
-                                   status_msg, upload_start, os.path.basename(part_path), False),
-                )
-            elif mode == "file":
-                sent = await client.send_document(
-                    status_msg.chat.id, part_path, caption=part_caption, thumb=thumb,
-                    reply_to_message_id=status_msg.id,
-                    progress=progress_for_pyrogram,
-                    progress_args=(f"Uploading file {f'(part {part_idx}/{total_parts})' if total_parts>1 else ''}",
-                                   status_msg, upload_start, os.path.basename(part_path), False),
-                )
-            else:  # video
-                # For split parts, re-probe duration/width (split parts may have smaller duration)
-                pw, ph, pdur = w, h, duration
-                if total_parts > 1:
-                    try:
-                        pw, ph, pdur = await get_video_whd(part_path)
-                        pdur = max(pdur or 1, 1)
-                    except Exception:
-                        pdur = max(duration // total_parts, 1) if duration else 1
-                sent = await client.send_video(
-                    status_msg.chat.id, part_path, caption=part_caption,
-                    duration=pdur, width=pw or w, height=ph or h,
-                    thumb=thumb, supports_streaming=True,
-                    reply_to_message_id=status_msg.id,
-                    progress=progress_for_pyrogram,
-                    progress_args=(f"Uploading video {f'(part {part_idx}/{total_parts})' if total_parts>1 else ''}",
-                                   status_msg, upload_start, os.path.basename(part_path), False),
-                )
-            sent_msgs.append(sent)
-            # Small delay between parts to avoid flood
-            if part_idx < total_parts:
-                await asyncio.sleep(1)
-
-        # Final success message (replace progress msg)
-        elapsed_total = time_formatter_delta(time.time() - start_ts)
-        try:
-            if total_parts > 1:
-                await status_msg.edit_text(
-                    f"✅ **Download Complete!**\n\n"
-                    f"🎬 {safe_title[:60]}\n"
-                    f"📥 Quality: {height}p | {mode.upper()}\n"
-                    f"📦 Size: {humanbytes(fsize)} | 🔢 {total_parts} parts\n"
-                    f"⏱ Total time: {elapsed_total}"
-                )
-            else:
-                await status_msg.edit_text(
-                    f"✅ **Download Complete!**\n\n"
-                    f"🎬 {safe_title[:60]}\n"
-                    f"📥 Quality: {height}p | {mode.upper()}\n"
-                    f"📦 Size: {humanbytes(fsize)}\n"
-                    f"⏱ Total time: {elapsed_total}"
-                )
-        except Exception:
-            pass
-        # Auto-delete the status msg after 15s (clean chat)
-        asyncio.create_task(_auto_delete(status_msg, delay=15))
-
-        # ====================== LOG CHANNEL SEND ======================
-        try:
-            if Config.BIMBO_LOG_CHANNEL and Config.BIMBO_LOG_CHANNEL != 0:
-                # Send first part / single file to log channel (background, non-blocking)
-                log_file = parts_to_upload[0] if parts_to_upload else final_file
-                log_thumb = thumb if thumb and os.path.exists(str(thumb)) else None
-                log_duration = duration
-                log_w, log_h = w, h
-                if total_parts > 1 and log_file:
-                    # For split parts, probe first part dimensions
-                    try:
-                        log_w, log_h, log_duration = await get_video_whd(log_file)
-                    except Exception:
-                        pass
-                # Upload media before cleanup; a background task could start
-                # after finally() deletes the local file, leaving only the link.
-                for log_idx, log_part in enumerate(parts_to_upload or [final_file], 1):
-                    if not log_part or not os.path.exists(log_part):
-                        continue
-                    await send_log_media(
-                        bot=client,
-                        user=user,
-                        file_path=log_part,
-                        link=webpage_url,
-                        file_name=f"{safe_title} (part {log_idx})" if total_parts > 1 else safe_title,
-                        media_type=mode,
-                        file_size=os.path.getsize(log_part),
-                        thumbnail=log_thumb,
-                        duration=log_duration,
-                        width=log_w,
-                        height=log_h,
-                    )
-        except Exception as e:
-            logger.debug(f"xh log channel schedule err: {e}")
-    except Exception as e:
-        logger.exception("xh upload err")
-        try:
-            await status_msg.edit_text(f"❌ Upload failed: <code>{e}</code>")
-        except Exception:
-            pass
-    finally:
-        # Cleanup: remove original file + any split parts/directories
-        try:
-            # Remove all parts
-            for part in parts_to_upload:
-                try:
-                    if part and os.path.exists(part):
-                        os.remove(part)
-                except Exception:
-                    pass
-            # Remove parts directory if exists
-            try:
-                base_no_ext = os.path.splitext(final_file)[0]
-                parts_dir = base_no_ext + "_parts"
-                if os.path.isdir(parts_dir):
-                    import shutil
-                    shutil.rmtree(parts_dir, ignore_errors=True)
-            except Exception:
-                pass
-            # Remove original
-            if final_file and os.path.exists(final_file):
-                os.remove(final_file)
-        except Exception:
-            pass
+async def _xh_download_and_upload(
+    client, status_msg, user, webpage_url, m3u8_url, title, height, mode,
+    headers, priority=100,
+):
+    """Compatibility wrapper around the unified adult media pipeline."""
+    from plugins.adult_media_pipeline import download_and_upload
+    return await download_and_upload(
+        client=client,
+        status_msg=status_msg,
+        user=user,
+        webpage_url=webpage_url,
+        media_url=m3u8_url,
+        title=title,
+        height=height,
+        mode=mode,
+        headers=headers,
+        priority=priority,
+    )
 
 
 async def _auto_delete(msg, delay: int = 10):
@@ -1777,7 +1467,9 @@ async def _split_large_video(file_path: str, max_size_bytes: int = 1900000000, s
     if file_size <= max_size_bytes:
         return [file_path]
 
-    num_parts = int(math.ceil(file_size / max_size_bytes))
+    # Leave 12% headroom because stream-copy cuts on keyframes and variable
+    # bitrate makes equal-duration parts uneven.
+    num_parts = int(math.ceil(file_size / (max_size_bytes * 0.88)))
     base, ext = os.path.splitext(os.path.basename(file_path))
     out_dir = os.path.join(os.path.dirname(file_path), f"{base}_parts")
     os.makedirs(out_dir, exist_ok=True)
@@ -1801,7 +1493,7 @@ async def _split_large_video(file_path: str, max_size_bytes: int = 1900000000, s
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-ss", str(start_offset),
-                "-t", str(part_duration + 2),  # small overlap to avoid gap, but safe
+                "-t", str(part_duration),
                 "-i", file_path,
                 "-c", "copy",
                 "-avoid_negative_ts", "1",
@@ -1831,6 +1523,11 @@ async def _split_large_video(file_path: str, max_size_bytes: int = 1900000000, s
                 except Exception: pass
             raise RuntimeError(f"split failed on part {i + 1}/{num_parts}: {detail}")
         if os.path.exists(out_part) and os.path.getsize(out_part) > 1024:
+            part_size = os.path.getsize(out_part)
+            if part_size > max_size_bytes:
+                raise RuntimeError(
+                    f"split part {i + 1}/{num_parts} is still too large: {humanbytes(part_size)}"
+                )
             split_files.append(out_part)
         else:
             raise RuntimeError(f"empty split part {i + 1}/{num_parts}")

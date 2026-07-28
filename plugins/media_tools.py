@@ -16,6 +16,8 @@ import asyncio
 import logging
 import shutil
 import zipfile
+from contextlib import asynccontextmanager
+from functools import wraps
 from io import BytesIO
 
 from PIL import Image, ImageDraw, ImageFont
@@ -34,8 +36,160 @@ from plugins.video_utils import (
     video_converter, screenshot_generator, get_video_duration,
     generate_multiple_screenshots, extract_audio,
 )
+from helper_funcs.display_progress import (
+    claim_user_progress_message, finalize_user_progress, get_task,
+    get_user_message, register_task, remove_task, set_task_stage,
+    update_task, update_user_progress,
+)
+from plugins.media_pipeline import (
+    PRIORITY_INTERACTIVE, begin_interactive_job, end_interactive_job, stage_slot,
+)
 
 logger = logging.getLogger(__name__)
+
+_COMMAND_CONTEXT = {}
+
+
+def _context_key(message):
+    return (int(message.chat.id), int(message.id))
+
+
+class _DashboardProxy:
+    """Message-like object that keeps handler edits inside BIMBO LIVE."""
+
+    def __init__(self, client, message, dashboard, task_id, label):
+        self.client = client
+        self.command = message
+        self.dashboard = dashboard
+        self.task_id = task_id
+        self.label = label
+        self.id = dashboard.id
+        self.message_id = dashboard.id
+        self.chat = dashboard.chat
+
+    async def edit_text(self, text, **kwargs):
+        lower = str(text or "").lower()
+        if any(word in lower for word in ("upload", "sending")):
+            status, engine = "waiting", "pyrogram"
+        elif any(word in lower for word in ("ffmpeg", "generat", "trim", "compress", "extract", "watermark", "cutting")):
+            status, engine = "processing", "ffmpeg"
+        elif "download" in lower:
+            status, engine = "waiting", "pyrogram"
+        elif any(word in lower for word in ("failed", "error", "❌")):
+            status, engine = "failed", "ffmpeg"
+        else:
+            status, engine = "processing", "ffmpeg"
+        detail = re.sub(r"<[^>]+>", "", str(text or ""))
+        detail = re.sub(r"\s+", " ", detail).strip()
+        set_task_stage(self.task_id, status=status, engine=engine, detail=detail)
+        await update_user_progress(self.client, self.command.from_user.id, force=True)
+        if status == "failed":
+            try:
+                await self.client.send_message(
+                    self.command.chat.id, str(text)[:3500],
+                    reply_to_message_id=self.command.id,
+                )
+            except Exception:
+                pass
+        return self
+
+    async def edit(self, text=None, **kwargs):
+        return await self.edit_text(text, **kwargs)
+
+    async def delete(self):
+        # The decorator owns canonical dashboard lifecycle.
+        return None
+
+
+async def _command_proxy(message):
+    ctx = _COMMAND_CONTEXT.get(_context_key(message))
+    return ctx["proxy"] if ctx else None
+
+
+def _interactive_media_task(label):
+    def decorator(func):
+        @wraps(func)
+        async def wrapped(client, message, *args, **kwargs):
+            uid = int(message.from_user.id)
+            task_id = f"cmd_{func.__name__}_{uid}_{time.time_ns()}"
+            await begin_interactive_job(task_id)
+            current = get_user_message(uid)
+            if current is None:
+                candidate = await safe_reply_text(message, f"⚡ {label} queued with priority...")
+                if candidate is None:
+                    candidate = await client.send_message(
+                        message.chat.id, f"⚡ {label} queued with priority..."
+                    )
+                dashboard = await claim_user_progress_message(uid, candidate, delete_duplicate=False)
+            else:
+                dashboard = current
+            register_task(
+                task_id, uid, label, 0,
+                task_type="download", engine="pyrogram", source_url=func.__name__,
+            )
+            proxy = _DashboardProxy(client, message, dashboard, task_id, label)
+            _COMMAND_CONTEXT[_context_key(message)] = {
+                "task_id": task_id, "dashboard": dashboard, "proxy": proxy,
+                "client": client, "uid": uid,
+            }
+            await update_user_progress(client, uid, force=True)
+            try:
+                return await func(client, message, *args, **kwargs)
+            except Exception as exc:
+                task = get_task(task_id)
+                if task:
+                    task["error"] = str(exc)[:250]
+                update_task(
+                    task_id, (task or {}).get("downloaded", 0),
+                    (task or {}).get("total_size", 0), 0,
+                    status="failed", engine=(task or {}).get("engine", "ffmpeg"),
+                )
+                await update_user_progress(client, uid, force=True)
+                raise
+            finally:
+                _COMMAND_CONTEXT.pop(_context_key(message), None)
+                remove_task(task_id)
+                await end_interactive_job(task_id)
+                await finalize_user_progress(client, uid, dashboard)
+        return wrapped
+    return decorator
+
+
+@asynccontextmanager
+async def _command_upload_slot(message):
+    ctx = _COMMAND_CONTEXT.get(_context_key(message))
+    if not ctx:
+        yield
+        return
+    task_id, uid, client = ctx["task_id"], ctx["uid"], ctx["client"]
+    set_task_stage(
+        task_id, task_type="upload", status="waiting", engine="pyrogram",
+        downloaded=0, total_size=0, reset_timer=True,
+    )
+    async with stage_slot(
+        "upload", task_id, uid, site="command", client=client,
+        priority=PRIORITY_INTERACTIVE,
+    ):
+        set_task_stage(task_id, task_type="upload", status="uploading", engine="pyrogram")
+        await update_user_progress(client, uid, force=True)
+        yield
+
+
+async def _priority_send(message, sender, *args, **kwargs):
+    """Send command output through one of the two global upload slots."""
+    ctx = _COMMAND_CONTEXT.get(_context_key(message))
+    async with _command_upload_slot(message):
+        if ctx and getattr(sender, "__name__", "") != "send_media_group" and "progress" not in kwargs:
+            task_id, uid, client = ctx["task_id"], ctx["uid"], ctx["client"]
+            upload_start = time.time()
+
+            async def progress(current, total):
+                speed = int(current / max(time.time() - upload_start, 0.001))
+                update_task(task_id, current, total, speed, "uploading", "pyrogram")
+                await update_user_progress(client, uid)
+
+            kwargs["progress"] = progress
+        return await sender(*args, **kwargs)
 
 
 # ---------- helpers ----------
@@ -58,37 +212,68 @@ def _to_seconds(s: str) -> int:
 
 
 async def _download_replied(client: Client, msg: Message, uid: int, out_dir: str) -> str:
-    """Download replied media to out_dir, returns local file path."""
+    """Priority-download replied Telegram media into the unified dashboard."""
     os.makedirs(out_dir, exist_ok=True)
-    status = await safe_reply_text(msg, "📥 Downloading media...")
-    path = None
+    ctx = _COMMAND_CONTEXT.get(_context_key(msg))
+    status = ctx["proxy"] if ctx else await safe_reply_text(msg, "📥 Downloading media...")
+    task_id = ctx["task_id"] if ctx else f"cmd_dl_{uid}_{time.time_ns()}"
 
-    def progress(current, total):
-        pass  # keep fast
+    async def progress(current, total):
+        speed = 0
+        task = get_task(task_id)
+        if task:
+            elapsed = max(time.time() - task.get('start_time', time.time()), 0.001)
+            speed = int(current / elapsed)
+        update_task(task_id, current, total, speed, "downloading", "pyrogram")
+        await update_user_progress(client, uid)
 
     try:
-        if msg.reply_to_message.video:
-            path = await msg.reply_to_message.download(
-                file_name=os.path.join(out_dir, msg.reply_to_message.video.file_name or "video.mp4"),
+        async with stage_slot(
+            "download", task_id, uid, site="command", client=client,
+            priority=PRIORITY_INTERACTIVE,
+        ):
+            set_task_stage(
+                task_id, task_type="download", status="downloading",
+                engine="pyrogram", reset_timer=True,
+                detail="Downloading replied Telegram media",
             )
-        elif msg.reply_to_message.document:
-            fn = msg.reply_to_message.document.file_name or f"doc_{int(time.time())}"
-            path = await msg.reply_to_message.download(file_name=os.path.join(out_dir, safe_filename(fn)))
-        elif msg.reply_to_message.audio:
-            fn = msg.reply_to_message.audio.file_name or "audio.mp3"
-            path = await msg.reply_to_message.download(file_name=os.path.join(out_dir, safe_filename(fn)))
-        elif msg.reply_to_message.photo:
-            path = await msg.reply_to_message.download(file_name=os.path.join(out_dir, f"photo.jpg"))
-        elif msg.reply_to_message.animation:
-            path = await msg.reply_to_message.download(file_name=os.path.join(out_dir, "anim.gif"))
-        else:
-            await safe_edit_text(status, Translation.NO_VIDEO_REPLY)
-            return None, status
-    except Exception as e:
-        await safe_edit_text(status, f"❌ Download failed: <code>{e}</code>")
+            await update_user_progress(client, uid, force=True)
+            common = {"progress": progress}
+            if msg.reply_to_message.video:
+                path = await msg.reply_to_message.download(
+                    file_name=os.path.join(out_dir, msg.reply_to_message.video.file_name or "video.mp4"),
+                    **common,
+                )
+            elif msg.reply_to_message.document:
+                fn = msg.reply_to_message.document.file_name or f"doc_{int(time.time())}"
+                path = await msg.reply_to_message.download(
+                    file_name=os.path.join(out_dir, safe_filename(fn)), **common,
+                )
+            elif msg.reply_to_message.audio:
+                fn = msg.reply_to_message.audio.file_name or "audio.mp3"
+                path = await msg.reply_to_message.download(
+                    file_name=os.path.join(out_dir, safe_filename(fn)), **common,
+                )
+            elif msg.reply_to_message.photo:
+                path = await msg.reply_to_message.download(
+                    file_name=os.path.join(out_dir, "photo.jpg"), **common,
+                )
+            elif msg.reply_to_message.animation:
+                path = await msg.reply_to_message.download(
+                    file_name=os.path.join(out_dir, "anim.gif"), **common,
+                )
+            else:
+                await safe_edit_text(status, Translation.NO_VIDEO_REPLY)
+                return None, status
+    except Exception as exc:
+        await safe_edit_text(status, f"❌ Download failed: <code>{exc}</code>")
         return None, status
 
-    await status.delete()
+    set_task_stage(
+        task_id, task_type="download", status="processing", engine="ffmpeg",
+        downloaded=0, total_size=0, reset_timer=True,
+    )
+    await update_user_progress(client, uid, force=True)
     return path, None
 
 
@@ -111,6 +296,7 @@ def _cmd(*names):
 
 
 @Client.on_message(filters.private & _cmd('ss', 'screenshot', 'screens'))
+@_interactive_media_task("Screenshot generator")
 async def cmd_screenshot(client: Client, message: Message):
     if not message.reply_to_message or not is_media(message.reply_to_message):
         return await safe_reply_text(message, Translation.NO_VIDEO_REPLY)
@@ -125,7 +311,7 @@ async def cmd_screenshot(client: Client, message: Message):
 
     work = user_download_dir(uid) + f"/ss_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, err = await _download_replied(client, message, uid, work)
         if not path:
@@ -142,7 +328,7 @@ async def cmd_screenshot(client: Client, message: Message):
             media.append(InputMediaPhoto(s))
         # send in batches of 10
         for i in range(0, len(media), 10):
-            await client.send_media_group(message.chat.id, media[i:i+10],
+            await _priority_send(message, client.send_media_group, message.chat.id, media[i:i+10],
                                           reply_to_message_id=message.id)
         await msg.delete()
     except Exception as e:
@@ -154,6 +340,7 @@ async def cmd_screenshot(client: Client, message: Message):
 
 # ===================== SAMPLE VIDEO =====================
 @Client.on_message(filters.private & _cmd('sample'))
+@_interactive_media_task("Sample video")
 async def cmd_sample(client: Client, message: Message):
     if not message.reply_to_message or not (message.reply_to_message.video or message.reply_to_message.document):
         return await safe_reply_text(message, Translation.NO_VIDEO_REPLY)
@@ -168,7 +355,7 @@ async def cmd_sample(client: Client, message: Message):
 
     work = user_download_dir(uid) + f"/sample_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, _ = await _download_replied(client, message, uid, work)
         if not path:
@@ -191,7 +378,7 @@ async def cmd_sample(client: Client, message: Message):
             return await safe_edit_text(msg, f"❌ Sample failed: <code>{err[:500]}</code>")
         sz = os.path.getsize(out)
         await safe_edit_text(msg, "📤 Uploading sample...")
-        await client.send_video(message.chat.id, video=out,
+        await _priority_send(message, client.send_video, message.chat.id, video=out,
                                 caption=f"🎬 Sample ({secs}s) | {humanbytes(sz)}",
                                 supports_streaming=True,
                                 reply_to_message_id=message.id)
@@ -205,6 +392,7 @@ async def cmd_sample(client: Client, message: Message):
 
 # ===================== TRIM =====================
 @Client.on_message(filters.private & _cmd('trim', 'cut'))
+@_interactive_media_task("Video trim")
 async def cmd_trim(client: Client, message: Message):
     if not message.reply_to_message:
         return await safe_reply_text(message, 
@@ -225,7 +413,7 @@ async def cmd_trim(client: Client, message: Message):
     uid = message.from_user.id
     work = user_download_dir(uid) + f"/trim_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, _ = await _download_replied(client, message, uid, work)
         if not path:
@@ -242,7 +430,7 @@ async def cmd_trim(client: Client, message: Message):
         if rc != 0 or not os.path.exists(out):
             return await safe_edit_text(msg, f"❌ Trim failed: <code>{err[:600]}</code>")
         await safe_edit_text(msg, "📤 Uploading...")
-        await client.send_video(message.chat.id, video=out,
+        await _priority_send(message, client.send_video, message.chat.id, video=out,
                                 caption=f"✂️ Trimmed {time_formatter(s)} → {time_formatter(e)}",
                                 supports_streaming=True,
                                 reply_to_message_id=message.id)
@@ -256,6 +444,7 @@ async def cmd_trim(client: Client, message: Message):
 
 # ===================== COMPRESS =====================
 @Client.on_message(filters.private & _cmd('compress'))
+@_interactive_media_task("Video compression")
 async def cmd_compress(client: Client, message: Message):
     if not message.reply_to_message:
         return await safe_reply_text(message, "<b>Usage:</b> Reply to video with <code>/compress [low|med|high]</code>")
@@ -272,7 +461,7 @@ async def cmd_compress(client: Client, message: Message):
     uid = message.from_user.id
     work = user_download_dir(uid) + f"/cmp_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, _ = await _download_replied(client, message, uid, work)
         if not path:
@@ -294,7 +483,7 @@ async def cmd_compress(client: Client, message: Message):
         sz_in = os.path.getsize(path); sz_out = os.path.getsize(out)
         pct = 100 - (sz_out * 100 / max(sz_in, 1))
         await safe_edit_text(msg, "📤 Uploading...")
-        await client.send_video(message.chat.id, video=out,
+        await _priority_send(message, client.send_video, message.chat.id, video=out,
                                 caption=f"🗜️ Compressed ({preset})\n"
                                         f"Before: {humanbytes(sz_in)} → After: {humanbytes(sz_out)} "
                                         f"({pct:.1f}% smaller)",
@@ -310,6 +499,7 @@ async def cmd_compress(client: Client, message: Message):
 
 # ===================== WATERMARK =====================
 @Client.on_message(filters.private & _cmd('wm', 'watermark'))
+@_interactive_media_task("Watermark")
 async def cmd_watermark(client: Client, message: Message):
     # Usage: /wm "text" [top-left|top-right|bottom-left|bottom-right|center]
     # or reply to an image → use that as watermark
@@ -340,7 +530,7 @@ async def cmd_watermark(client: Client, message: Message):
     uid = message.from_user.id
     work = user_download_dir(uid) + f"/wm_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, _ = await _download_replied(client, message, uid, work)
         if not path:
@@ -379,7 +569,7 @@ async def cmd_watermark(client: Client, message: Message):
             out2 = Image.alpha_composite(img, txt).convert("RGB")
             out_jpg = os.path.splitext(out)[0] + ".jpg"
             out2.save(out_jpg, "JPEG", quality=92)
-            await client.send_photo(message.chat.id, out_jpg,
+            await _priority_send(message, client.send_photo, message.chat.id, out_jpg,
                                     caption=f"💧 Watermarked: {wm_text}",
                                     reply_to_message_id=message.id)
         else:
@@ -413,7 +603,7 @@ async def cmd_watermark(client: Client, message: Message):
             if rc != 0 or not os.path.exists(out):
                 return await safe_edit_text(msg, f"❌ Watermark failed: <code>{err[:600]}</code>")
             await safe_edit_text(msg, "📤 Uploading...")
-            await client.send_video(message.chat.id, video=out,
+            await _priority_send(message, client.send_video, message.chat.id, video=out,
                                     caption=f"💧 Watermarked: {wm_text}",
                                     supports_streaming=True,
                                     reply_to_message_id=message.id)
@@ -427,13 +617,14 @@ async def cmd_watermark(client: Client, message: Message):
 
 # ===================== MP3 / AUDIO EXTRACT =====================
 @Client.on_message(filters.private & _cmd('mp3', 'audio', 'extract_audio'))
+@_interactive_media_task("Audio extraction")
 async def cmd_mp3(client: Client, message: Message):
     if not message.reply_to_message or not (message.reply_to_message.video or message.reply_to_message.document):
         return await safe_reply_text(message, Translation.NO_VIDEO_REPLY)
     uid = message.from_user.id
     work = user_download_dir(uid) + f"/mp3_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, _ = await _download_replied(client, message, uid, work)
         if not path:
@@ -444,7 +635,7 @@ async def cmd_mp3(client: Client, message: Message):
         if not out_path:
             return await safe_edit_text(msg, "❌ Audio extract failed.")
         await safe_edit_text(msg, "📤 Uploading...")
-        await client.send_audio(message.chat.id, audio=out_path,
+        await _priority_send(message, client.send_audio, message.chat.id, audio=out_path,
                                 caption="🎵 Extracted by BIMBO",
                                 reply_to_message_id=message.id)
         await msg.delete()
@@ -457,17 +648,40 @@ async def cmd_mp3(client: Client, message: Message):
 
 # ===================== ZIP =====================
 @Client.on_message(filters.private & _cmd('zip'))
+@_interactive_media_task("ZIP creator")
 async def cmd_zip(client: Client, message: Message):
-    """Reply to multiple files (user can forward many and then /zip as reply to last)."""
-    # For simplicity: download the single replied file, or instruct user.
-    return await safe_reply_text(message, 
-        "ℹ️ For bulk zip, use /zip after sending multiple files and replying to one. "
-        "Beta: current version zips the single replied media into a zip."
-    )
+    """Download the replied media, create a ZIP, then priority-upload it."""
+    if not message.reply_to_message or not is_media(message.reply_to_message):
+        return await safe_reply_text(message, "❌ Reply to a file/media with <code>/zip</code>.")
+    uid = message.from_user.id
+    work = user_download_dir(uid) + f"/zip_{int(time.time())}"
+    os.makedirs(work, exist_ok=True)
+    msg = await _command_proxy(message)
+    try:
+        path, _ = await _download_replied(client, message, uid, work)
+        if not path:
+            return
+        await safe_edit_text(msg, "📦 Creating ZIP archive...")
+        zip_name = safe_filename(os.path.basename(path)) + ".zip"
+        zip_path = os.path.join(work, zip_name)
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.write(path, arcname=os.path.basename(path))
+        await safe_edit_text(msg, "📤 Uploading ZIP...")
+        await _priority_send(
+            message, client.send_document, message.chat.id, zip_path,
+            caption=f"📦 {zip_name}", reply_to_message_id=message.id,
+        )
+        await msg.delete()
+    except Exception as exc:
+        logger.exception("zip error")
+        await safe_edit_text(msg, f"❌ ZIP error: <code>{exc}</code>")
+    finally:
+        asyncio.create_task(cleanup_dir(work))
 
 
 # ===================== UNZIP =====================
 @Client.on_message(filters.private & _cmd('unzip', 'extract'))
+@_interactive_media_task("ZIP extraction")
 async def cmd_unzip(client: Client, message: Message):
     if not message.reply_to_message or not message.reply_to_message.document:
         return await safe_reply_text(message, "❌ Reply to a .zip file.")
@@ -477,7 +691,7 @@ async def cmd_unzip(client: Client, message: Message):
     uid = message.from_user.id
     work = user_download_dir(uid) + f"/uz_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, _ = await _download_replied(client, message, uid, work)
         if not path:
@@ -502,7 +716,7 @@ async def cmd_unzip(client: Client, message: Message):
                 sz = os.path.getsize(f)
                 if sz > Config.BIMBO_TG_MAX_FILE_SIZE:
                     continue
-                await client.send_document(message.chat.id, f,
+                await _priority_send(message, client.send_document, message.chat.id, f,
                                            reply_to_message_id=message.id)
             except Exception as e:
                 logger.warning(f"unzip upload fail: {e}")
@@ -518,6 +732,7 @@ async def cmd_unzip(client: Client, message: Message):
 
 # ===================== RENAME =====================
 @Client.on_message(filters.private & _cmd('rename', 'rn'))
+@_interactive_media_task("File rename")
 async def cmd_rename(client: Client, message: Message):
     if not message.reply_to_message:
         return await safe_reply_text(message, "<b>Usage:</b> Reply to a file/video with <code>/rename new_name.mp4</code>")
@@ -528,7 +743,7 @@ async def cmd_rename(client: Client, message: Message):
     uid = message.from_user.id
     work = user_download_dir(uid) + f"/rn_{int(time.time())}"
     os.makedirs(work, exist_ok=True)
-    msg = await safe_reply_text(message, Translation.PROCESSING)
+    msg = await _command_proxy(message)
     try:
         path, _ = await _download_replied(client, message, uid, work)
         if not path:
@@ -537,12 +752,12 @@ async def cmd_rename(client: Client, message: Message):
         shutil.copy(path, new_path)
         await safe_edit_text(msg, "📤 Uploading...")
         if new_name.lower().endswith((".mp4", ".mkv", ".webm", ".mov")):
-            await client.send_video(message.chat.id, new_path,
+            await _priority_send(message, client.send_video, message.chat.id, new_path,
                                     caption=f"✏️ Renamed: <b>{new_name}</b>",
                                     supports_streaming=True,
                                     reply_to_message_id=message.id)
         else:
-            await client.send_document(message.chat.id, new_path,
+            await _priority_send(message, client.send_document, message.chat.id, new_path,
                                        caption=f"✏️ Renamed: <b>{new_name}</b>",
                                        reply_to_message_id=message.id)
         await msg.delete()

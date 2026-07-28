@@ -102,6 +102,10 @@ class Config(object):
     # ==================================================================
     BIMBO_WORKERS = _int("BIMBO_WORKERS", 8)
     BIMBO_MAX_CONCURRENT_TASKS = _int("BIMBO_MAX_CONCURRENT_TASKS", 2)
+    # Unified media pipeline: independent global stage limits. Queued jobs use
+    # fair FIFO and do not create extra subprocesses while waiting.
+    BIMBO_MAX_CONCURRENT_DOWNLOADS = max(1, _int("BIMBO_MAX_CONCURRENT_DOWNLOADS", 2))
+    BIMBO_MAX_CONCURRENT_UPLOADS = max(1, _int("BIMBO_MAX_CONCURRENT_UPLOADS", 2))
     BIMBO_PROGRESS_UPDATE_INTERVAL = _int("BIMBO_PROGRESS_UPDATE_INTERVAL", 3)
     YTDLP_CONCURRENT_FRAGMENTS = _int("YTDLP_CONCURRENT_FRAGMENTS", 10)
     # xHamster's CDN rate-limits bursty HLS fragment traffic more aggressively.

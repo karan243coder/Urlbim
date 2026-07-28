@@ -35,8 +35,17 @@ from plugins.eporner_engine import (
     is_eporner, UA, QLABEL, extract_video as ep_extract, extract_listing as ep_listing,
     _parse_duration_sec, _clean_eporner_page_url,
 )
+from plugins.media_pipeline import set_bulk_backlog, clear_bulk_backlog
 
 logger = logging.getLogger(__name__)
+
+
+async def _auto_delete_message(message, delay=15):
+    try:
+        await asyncio.sleep(delay)
+        await message.delete()
+    except Exception:
+        pass
 
 # Global store for eporner listings (token -> listing data)
 _EP_STORE = {}
@@ -53,6 +62,7 @@ async def create_job(user_id, chat_id, title, url, items):
     _EP_JOBS[job_id] = {
         "id": job_id,
         "user_id": user_id,
+        "owner_id": user_id,
         "chat_id": chat_id,
         "title": title,
         "url": url,
@@ -176,16 +186,28 @@ async def _ep_full_queue_worker(client, job_id, user, status_msg):
             item = await claim_next_item(job_id)
             if not item:
                 await update_job(job_id, status="completed")
-                try: await safe_edit_text(status_msg, f"✅ Full profile queue complete\n\nDone: {completed} | Failed: {failed}")
-                except Exception: pass
+                clear_bulk_backlog(job_id)
+                try:
+                    done_msg = await client.send_message(
+                        status_msg.chat.id,
+                        f"✅ Full profile queue complete\n\nDone: {completed} | Failed: {failed}",
+                    )
+                    asyncio.create_task(_auto_delete_message(done_msg, 15))
+                except Exception:
+                    pass
                 return
             idx = item.get("index", 0) + 1
             title = item.get("title", "Video")
             current_job = await get_job(job_id)
             total = len((current_job or {}).get("items", []))
-            try:
-                await safe_edit_text(status_msg, f"📥 Full profile queue\n\n🔽 {idx}/{total} processing\n🎬 {title[:70]}\n✅ Done: {completed} | ❌ Failed: {failed}")
-            except Exception: pass
+            pending = sum(
+                1 for queued_item in (current_job or {}).get("items", [])
+                if queued_item.get("status") == "pending"
+            )
+            set_bulk_backlog(
+                job_id, user.id, pending, site="eporner",
+                label=(current_job or {}).get("title", "Eporner Profile"),
+            )
 
             url = item.get("url", "")
             best_url = url
@@ -201,16 +223,18 @@ async def _ep_full_queue_worker(client, job_id, user, status_msg):
             except Exception as e:
                 logger.warning(f"ep full queue prefetch fail: {e}")
 
-            prog = await client.send_message(status_msg.chat.id, f"🔽 #{idx} downloading: {title[:60]}")
             try:
                 from plugins.xhamster_upgrade import _xh_download_and_upload
-                await asyncio.wait_for(
+                ok = await asyncio.wait_for(
                     _xh_download_and_upload(
-                        client, prog, user, url, best_url, title, best_h, "video",
-                        {"User-Agent": UA, "Referer": url, "Origin": "https://www.eporner.com"}
+                        client, status_msg, user, url, best_url, title, best_h, "video",
+                        {"User-Agent": UA, "Referer": url, "Origin": "https://www.eporner.com"},
+                        priority=0,
                     ),
                     timeout=max(300, int(Config.BIMBO_PROCESS_MAX_TIMEOUT))
                 )
+                if not ok:
+                    raise RuntimeError("media pipeline failed")
                 await finish_item(job_id, item["index"], "completed")
                 completed += 1
             except asyncio.TimeoutError:
@@ -222,6 +246,7 @@ async def _ep_full_queue_worker(client, job_id, user, status_msg):
             gc.collect()
             await asyncio.sleep(5)
     except Exception as exc:
+        clear_bulk_backlog(job_id)
         await update_job(job_id, status="paused", last_error=str(exc)[:500])
 
 
@@ -384,7 +409,16 @@ async def ep_callbacks(client: Client, c: CallbackQuery):
                 if not all_items:
                     return await safe_edit_text(status_msg, "❌ No videos found for queue.")
                 job_id = await create_job(c.from_user.id, c.message.chat.id, entry.get("title", "Eporner Channel"), entry.get("current_url", ""), all_items)
-                await safe_edit_text(status_msg, f"✅ Eporner Queue Created\n\n📋 Videos: {len(all_items)}\n⚡ Mode: 1-by-1\n📦 Max Quality\n🔁 Restart-safe queue")
+                set_bulk_backlog(
+                    job_id, c.from_user.id, len(all_items), site="eporner",
+                    label=entry.get("title", "Eporner Channel"),
+                )
+                await safe_edit_text(
+                    status_msg,
+                    f"✅ Added to unified queue\n\n📋 Videos: {len(all_items)}\n"
+                    f"⬇️ Global download slots: 2\n⬆️ Global upload slots: 2\n"
+                    f"🧭 Fair FIFO enabled",
+                )
                 asyncio.create_task(_ep_full_queue_worker(client, job_id, c.from_user, status_msg))
             except Exception as exc:
                 logger.exception("ep full queue create failed")
@@ -396,7 +430,7 @@ async def ep_callbacks(client: Client, c: CallbackQuery):
             entry = _EP_STORE.get(token)
             if not entry:
                 return await c.answer("Session expired", show_alert=True)
-            items = entry.get("items", [])[:8]
+            items = entry.get("items", [])[:10]
             if not items:
                 return await c.answer("No videos", show_alert=True)
 
@@ -427,40 +461,28 @@ async def ep_callbacks(client: Client, c: CallbackQuery):
             except Exception as e:
                 logger.exception(f"ep all prefetch err: {e}")
 
-                from plugins.xhamster_upgrade import _xh_download_and_upload
-                # Semaphore removed
+            from plugins.xhamster_upgrade import _xh_download_and_upload
+
             async def _run_one(job):
-                if True:  # Semaphore removed
-                    item = job["item"]
-                    title = item.get("title", "Video")
-                    i = job["idx"]
-                    url = job["final_url"]
-                    best_h = job["best_h"]
-                    best_m3u8 = job["best_m3u8"]
-                    try:
-                        prog_msg = await client.send_message(
-                            c.message.chat.id,
-                            f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}...",
-                            reply_to_message_id=c.message.id,
-                        )
-                    except Exception:
-                        prog_msg = await c.message.reply_text(
-                            f"🔽 #{i}/{len(items)} Starting {best_h}p download: {title[:50]}..."
-                        )
-                    await _xh_download_and_upload(
-                        client, prog_msg, c.from_user, url, best_m3u8, title, best_h, "video",
-                        {"User-Agent": UA, "Referer": url, "Origin": "https://www.eporner.com"}
-                    )
+                item = job["item"]
+                title = item.get("title", "Video")
+                url = job["final_url"]
+                best_h = job["best_h"]
+                best_m3u8 = job["best_m3u8"]
+                await _xh_download_and_upload(
+                    client, status_msg, c.from_user, url, best_m3u8, title, best_h, "video",
+                    {"User-Agent": UA, "Referer": url, "Origin": "https://www.eporner.com"},
+                    priority=0,
+                )
 
             for job in download_jobs:
                 asyncio.create_task(_run_one(job))
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.2)
 
             try:
-                await safe_edit_text(status_msg, 
-                    f"✅ **Eporner Download All Started!**\n\n"
-                    f"📥 {len(items)} videos queue me hain (best quality per video).\n"
-                    f"⚡ Max 2 concurrent downloads (RAM-safe)."
+                await c.answer(
+                    f"{len(download_jobs)} videos unified queue me add hue",
+                    show_alert=True,
                 )
             except Exception:
                 pass

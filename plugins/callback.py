@@ -12,6 +12,7 @@ from plugins.youtube_dl_button import youtube_dl_call_back, terabox_call_back
 from plugins.dl_button import ddl_call_back
 from translation import Translation
 from plugins.forcesub import get_invite_link
+from plugins.media_pipeline import begin_interactive_job, end_interactive_job
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -62,16 +63,14 @@ async def button(bot, update):
             except Exception:
                 pass
             
-            from utils import GLOBAL_DOWNLOAD_SEM
-            from plugins.preemption_manager import pause_bulk_jobs, resume_bulk_jobs
-            
-            async with GLOBAL_DOWNLOAD_SEM:
-                paused_jobs = await pause_bulk_jobs(user_id)
-                try:
-                    await youtube_dl_call_back(bot, update)
-                finally:
-                    if paused_jobs:
-                        await resume_bulk_jobs(user_id, bot)
+            # Active bulk downloads finish naturally; this interactive single
+            # gets the next free slot before any new bulk item.
+            interactive_id = f"single_{user_id}_{time.time_ns()}"
+            await begin_interactive_job(interactive_id)
+            try:
+                await youtube_dl_call_back(bot, update, priority=100)
+            finally:
+                await end_interactive_job(interactive_id)
 
         elif cb_data.startswith(("file=DIRECT=", "video=DIRECT=", "audio=DIRECT=")):
             # Route direct links through yt-dlp engine (headers, aria2, resume)
@@ -83,16 +82,14 @@ async def button(bot, update):
             except Exception:
                 pass
             
-            from utils import GLOBAL_DOWNLOAD_SEM
-            from plugins.preemption_manager import pause_bulk_jobs, resume_bulk_jobs
-            
-            async with GLOBAL_DOWNLOAD_SEM:
-                paused_jobs = await pause_bulk_jobs(user_id)
-                try:
-                    await youtube_dl_call_back(bot, update)
-                finally:
-                    if paused_jobs:
-                        await resume_bulk_jobs(user_id, bot)
+            # Active bulk downloads finish naturally; this interactive single
+            # gets the next free slot before any new bulk item.
+            interactive_id = f"single_{user_id}_{time.time_ns()}"
+            await begin_interactive_job(interactive_id)
+            try:
+                await youtube_dl_call_back(bot, update, priority=100)
+            finally:
+                await end_interactive_job(interactive_id)
 
         elif cb_data.startswith(("file=", "video=", "audio=")) and not cb_data.startswith((
             "file=DIRECT=", "video=DIRECT=", "audio=DIRECT="

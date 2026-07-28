@@ -20,7 +20,7 @@ from plugins.custom_thumbnail import Gthumb01, Gthumb02, Mdata01, Mdata02, Mdata
 from pyrogram import enums
 from pyrogram.types import InputMediaVideo, InputMediaDocument
 from helper_funcs.display_progress import progress_for_pyrogram, humanbytes, TimeFormatter
-from plugins.xhamster_runtime import XHAMSTER_DOWNLOAD_SEMAPHORE
+from plugins.media_pipeline import stage_slot
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -28,8 +28,7 @@ logger = logging.getLogger(__name__)
 
 PROGRESS_UPDATE_INTERVAL = 5
 
-# xHamster's CDN throttles shared cloud egress aggressively. The shared
-# semaphore is imported from xhamster_runtime so every xHamster plugin obeys it.
+# Site/global concurrency is enforced by plugins.media_pipeline.
 
 # Import shared download semaphore from utils
 # Generic-site semaphore is still handled by the surrounding queue.
@@ -350,7 +349,7 @@ async def send_log_media(
         logger.error(f"Log channel media error: {e}")
 
 
-async def youtube_dl_call_back(bot, update):
+async def youtube_dl_call_back(bot, update, priority=100):
     try:
         cb_data = update.data
         logger.info(f"Callback received: {cb_data[:100]}")
@@ -1077,33 +1076,15 @@ async def youtube_dl_call_back(bot, update):
     progress_msg_id = progress_msg.id
     await update_user_progress(bot, update.from_user.id, force=True)
 
-    # Large xHamster HLS streams are serialized per bot instance. The second
-    # task stays visible as WAITING instead of opening another CDN stream and
-    # freezing both downloads on shared-IP throttling.
-    xh_slot_acquired = False
-    if is_xh_engine:
-        if XHAMSTER_DOWNLOAD_SEMAPHORE.locked():
-            update_task(
-                progress_task_id, 0, 0, 0,
-                status='waiting', engine='yt-dlp'
-            )
-            await safe_edit(
-                update.message,
-                build_stage_card(
-                    display_name,
-                    "Queued safely — another xHamster download is active",
-                    "0 s",
-                ),
-            )
-            await update_user_progress(bot, update.from_user.id, force=True)
-        await XHAMSTER_DOWNLOAD_SEMAPHORE.acquire()
-        xh_slot_acquired = True
-        update_task(
-            progress_task_id, 0, 0, 0,
-            status='starting', engine='yt-dlp'
-        )
-        await update_user_progress(bot, update.from_user.id, force=True)
-    
+    # Enter the global fair download stage (2 slots for the whole bot).
+    pipeline_site = "xhamster" if is_xh_engine else ("eporner" if is_ep_engine else "yt-dlp")
+    download_stage_ctx = stage_slot(
+        "download", progress_task_id, update.from_user.id,
+        site=pipeline_site, client=bot, priority=priority,
+    )
+    await download_stage_ctx.__aenter__()
+    download_stage_acquired = True
+
     try:
         process = await asyncio.create_subprocess_exec(
             *command_to_exec,
@@ -1111,17 +1092,17 @@ async def youtube_dl_call_back(bot, update):
             stderr=asyncio.subprocess.STDOUT,
         )
     except FileNotFoundError:
-        if xh_slot_acquired:
-            XHAMSTER_DOWNLOAD_SEMAPHORE.release()
-            xh_slot_acquired = False
+        if download_stage_acquired:
+            await download_stage_ctx.__aexit__(None, None, None)
+            download_stage_acquired = False
         remove_task(progress_task_id)
         await safe_edit(update.message, "**ERROR:** `yt-dlp` install nahi hai. Requirements install/deploy dobara karo.")
         await finalize_user_progress(bot, update.from_user.id, progress_msg)
         return
     except Exception:
-        if xh_slot_acquired:
-            XHAMSTER_DOWNLOAD_SEMAPHORE.release()
-            xh_slot_acquired = False
+        if download_stage_acquired:
+            await download_stage_ctx.__aexit__(None, None, None)
+            download_stage_acquired = False
         remove_task(progress_task_id)
         await finalize_user_progress(bot, update.from_user.id, progress_msg)
         raise
@@ -1294,9 +1275,9 @@ async def youtube_dl_call_back(bot, update):
 
         await process.wait()
     finally:
-        if xh_slot_acquired:
-            XHAMSTER_DOWNLOAD_SEMAPHORE.release()
-            xh_slot_acquired = False
+        if download_stage_acquired:
+            await download_stage_ctx.__aexit__(None, None, None)
+            download_stage_acquired = False
     ytdlp_output = ytdlp_output.strip()
 
     if process.returncode != 0:
@@ -1356,40 +1337,44 @@ async def youtube_dl_call_back(bot, update):
                 if youtube_dl_password is not None:
                     fallback_cmd.extend(["--password", youtube_dl_password])
 
-                fb = await asyncio.create_subprocess_exec(
-                    *fallback_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-                fb_output = ""
-                while True:
-                    line = await fb.stdout.readline()
-                    if not line:
-                        break
-                    decoded_line = line.decode(errors="ignore").strip()
-                    if decoded_line:
-                        fb_output += decoded_line + "\n"
-                    now = time.time()
-                    elapsed_str = TimeFormatter(milliseconds=int((now - download_start_time) * 1000)) or "0 s"
-                    if "[download]" in decoded_line and "%" in decoded_line and now - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
-                        try:
-                            percent_match = re.search(r'(\d+\.?\d*)%', decoded_line)
-                            percentage = float(percent_match.group(1)) if percent_match else 0.0
-                            speed_match = re.search(r'at\s+(.+?)(?:\s+ETA|$)', decoded_line)
-                            speed = speed_match.group(1).strip() if speed_match else "Calculating..."
-                            size_match = re.search(r'of\s+~?\s*([\d\.]+\s*[KMGTP]?i?B)', decoded_line)
-                            total_size = size_match.group(1).strip() if size_match else "Unknown"
-                            eta_match = re.search(r'ETA\s+([0-9:]+)', decoded_line)
-                            eta = eta_match.group(1).strip() if eta_match else "Calculating..."
-                            await safe_edit(update.message, build_download_card(display_name, percentage, speed, total_size, eta, elapsed_str))
+                async with stage_slot(
+                    "download", progress_task_id, update.from_user.id,
+                    site=pipeline_site, client=bot, priority=priority,
+                ):
+                    fb = await asyncio.create_subprocess_exec(
+                        *fallback_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
+                    fb_output = ""
+                    while True:
+                        line = await fb.stdout.readline()
+                        if not line:
+                            break
+                        decoded_line = line.decode(errors="ignore").strip()
+                        if decoded_line:
+                            fb_output += decoded_line + "\n"
+                        now = time.time()
+                        elapsed_str = TimeFormatter(milliseconds=int((now - download_start_time) * 1000)) or "0 s"
+                        if "[download]" in decoded_line and "%" in decoded_line and now - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                            try:
+                                percent_match = re.search(r'(\d+\.?\d*)%', decoded_line)
+                                percentage = float(percent_match.group(1)) if percent_match else 0.0
+                                speed_match = re.search(r'at\s+(.+?)(?:\s+ETA|$)', decoded_line)
+                                speed = speed_match.group(1).strip() if speed_match else "Calculating..."
+                                size_match = re.search(r'of\s+~?\s*([\d\.]+\s*[KMGTP]?i?B)', decoded_line)
+                                total_size = size_match.group(1).strip() if size_match else "Unknown"
+                                eta_match = re.search(r'ETA\s+([0-9:]+)', decoded_line)
+                                eta = eta_match.group(1).strip() if eta_match else "Calculating..."
+                                await safe_edit(update.message, build_download_card(display_name, percentage, speed, total_size, eta, elapsed_str))
+                                last_progress_update = now
+                            except Exception:
+                                pass
+                        elif "[download]" in decoded_line and now - last_progress_update >= 3:
+                            await safe_edit(update.message, build_stage_card(display_name, "Fallback downloading stream...", elapsed_str))
                             last_progress_update = now
-                        except Exception:
-                            pass
-                    elif "[download]" in decoded_line and now - last_progress_update >= 3:
-                        await safe_edit(update.message, build_stage_card(display_name, "Fallback downloading stream...", elapsed_str))
-                        last_progress_update = now
 
-                await fb.wait()
+                    await fb.wait()
                 if fb.returncode != 0:
                     fb_last_error = "\n".join(fb_output.strip().splitlines()[-8:]) or "Unknown fallback error"
                     asyncio.create_task(clendir(tmp_directory_for_each_user))
@@ -1504,40 +1489,44 @@ async def youtube_dl_call_back(bot, update):
                     fresh_url,
                 ]
 
-                fb = await asyncio.create_subprocess_exec(
-                    *fallback_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                )
-                fb_output = ""
-                while True:
-                    line = await fb.stdout.readline()
-                    if not line:
-                        break
-                    decoded_line = line.decode(errors="ignore").strip()
-                    if decoded_line:
-                        fb_output += decoded_line + "\n"
-                    now = time.time()
-                    elapsed_str = TimeFormatter(milliseconds=int((now - download_start_time) * 1000)) or "0 s"
-                    if "[download]" in decoded_line and "%" in decoded_line and now - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
-                        try:
-                            percent_match = re.search(r'(\d+\.?\d*)%', decoded_line)
-                            percentage = float(percent_match.group(1)) if percent_match else 0.0
-                            speed_match = re.search(r'at\s+(.+?)(?:\s+ETA|$)', decoded_line)
-                            speed = speed_match.group(1).strip() if speed_match else "Calculating..."
-                            size_match = re.search(r'of\s+~?\s*([\d\.]+\s*[KMGTP]?i?B)', decoded_line)
-                            total_size = size_match.group(1).strip() if size_match else "Unknown"
-                            eta_match = re.search(r'ETA\s+([0-9:]+)', decoded_line)
-                            eta = eta_match.group(1).strip() if eta_match else "Calculating..."
-                            await safe_edit(update.message, build_download_card(display_name, percentage, speed, total_size, eta, elapsed_str))
+                async with stage_slot(
+                    "download", progress_task_id, update.from_user.id,
+                    site=pipeline_site, client=bot, priority=priority,
+                ):
+                    fb = await asyncio.create_subprocess_exec(
+                        *fallback_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
+                    fb_output = ""
+                    while True:
+                        line = await fb.stdout.readline()
+                        if not line:
+                            break
+                        decoded_line = line.decode(errors="ignore").strip()
+                        if decoded_line:
+                            fb_output += decoded_line + "\n"
+                        now = time.time()
+                        elapsed_str = TimeFormatter(milliseconds=int((now - download_start_time) * 1000)) or "0 s"
+                        if "[download]" in decoded_line and "%" in decoded_line and now - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                            try:
+                                percent_match = re.search(r'(\d+\.?\d*)%', decoded_line)
+                                percentage = float(percent_match.group(1)) if percent_match else 0.0
+                                speed_match = re.search(r'at\s+(.+?)(?:\s+ETA|$)', decoded_line)
+                                speed = speed_match.group(1).strip() if speed_match else "Calculating..."
+                                size_match = re.search(r'of\s+~?\s*([\d\.]+\s*[KMGTP]?i?B)', decoded_line)
+                                total_size = size_match.group(1).strip() if size_match else "Unknown"
+                                eta_match = re.search(r'ETA\s+([0-9:]+)', decoded_line)
+                                eta = eta_match.group(1).strip() if eta_match else "Calculating..."
+                                await safe_edit(update.message, build_download_card(display_name, percentage, speed, total_size, eta, elapsed_str))
+                                last_progress_update = now
+                            except Exception:
+                                pass
+                        elif "[download]" in decoded_line and now - last_progress_update >= 3:
+                            await safe_edit(update.message, build_stage_card(display_name, "Re-downloading with fresh URL...", elapsed_str))
                             last_progress_update = now
-                        except Exception:
-                            pass
-                    elif "[download]" in decoded_line and now - last_progress_update >= 3:
-                        await safe_edit(update.message, build_stage_card(display_name, "Re-downloading with fresh URL...", elapsed_str))
-                        last_progress_update = now
 
-                await fb.wait()
+                    await fb.wait()
                 if fb.returncode != 0:
                     fb_last_error = "\n".join(fb_output.strip().splitlines()[-8:]) or "Unknown fallback error"
                     asyncio.create_task(clendir(tmp_directory_for_each_user))
@@ -1639,6 +1628,13 @@ async def youtube_dl_call_back(bot, update):
             status='uploading', engine='pyrogram'
         )
         await update_user_progress(bot, update.from_user.id, force=True)
+
+        split_upload_ctx = stage_slot(
+            "upload", split_task_id, update.from_user.id,
+            site=pipeline_site, client=bot, priority=priority,
+        )
+        await split_upload_ctx.__aenter__()
+        split_upload_acquired = True
         
         # Upload all parts with individual progress tracking
         try:
@@ -1733,6 +1729,9 @@ async def youtube_dl_call_back(bot, update):
             
             # Finish only this split task. Keep the canonical dashboard if the
             # user's second download/upload is still active.
+            if split_upload_acquired:
+                await split_upload_ctx.__aexit__(None, None, None)
+                split_upload_acquired = False
             remove_task(split_task_id)
             await finalize_user_progress(
                 bot, update.from_user.id, progress_msg, delete_if_idle=True
@@ -1781,6 +1780,9 @@ async def youtube_dl_call_back(bot, update):
         except Exception as e:
             logger.error(f"Split upload error: {e}")
             await safe_edit(update.message, f"❌ ERROR: {str(e)[:200]}")
+            if split_upload_acquired:
+                await split_upload_ctx.__aexit__(None, None, None)
+                split_upload_acquired = False
             remove_task(split_task_id)
             await finalize_user_progress(bot, update.from_user.id, progress_msg)
             asyncio.create_task(clendir(tmp_directory_for_each_user))
@@ -1805,6 +1807,13 @@ async def youtube_dl_call_back(bot, update):
     )
     remove_task(progress_task_id)
     await update_user_progress(bot, update.from_user.id, force=True)
+
+    upload_stage_ctx = stage_slot(
+        "upload", upload_task_id, update.from_user.id,
+        site=pipeline_site, client=bot, priority=priority,
+    )
+    await upload_stage_ctx.__aenter__()
+    upload_stage_acquired = True
 
     thumbnail = None
     duration = 0
@@ -1894,15 +1903,9 @@ async def youtube_dl_call_back(bot, update):
                 progress_args=(Translation.BIMBO_UPLOAD_START, progress_msg, start_time, file_name, False),
             )
 
-        # Mark/remove only THIS task. The shared dashboard is deleted only when
-        # no other task for the user remains active.
-        update_task(upload_task_id, file_size, file_size, 0, 'completed', 'pyrogram')
-        remove_task(upload_task_id)
-        await asyncio.sleep(1)
-        await finalize_user_progress(
-            bot, update.from_user.id, progress_msg, delete_if_idle=True
-        )
-        
+        # Keep the upload stage slot through the optional log-channel transfer.
+        # Task completion/final dashboard cleanup happens after send_log_media.
+
         # DELETE the original message (update.message) if it's different from progress_msg
         if update.message.id != progress_msg.id:
             try:
@@ -1957,6 +1960,15 @@ async def youtube_dl_call_back(bot, update):
             width=width,
             height=height,
         )
+
+        if upload_stage_acquired:
+            await upload_stage_ctx.__aexit__(None, None, None)
+            upload_stage_acquired = False
+        update_task(upload_task_id, file_size, file_size, 0, 'completed', 'pyrogram')
+        remove_task(upload_task_id)
+        await finalize_user_progress(
+            bot, update.from_user.id, progress_msg, delete_if_idle=True
+        )
         
         # Record download in quota system for real usage tracking
         from plugins.user_quota import record_user_download
@@ -1971,6 +1983,9 @@ async def youtube_dl_call_back(bot, update):
         asyncio.create_task(clendir(file_location))
         if thumbnail:
             asyncio.create_task(clendir(thumbnail))
+        if upload_stage_acquired:
+            await upload_stage_ctx.__aexit__(None, None, None)
+            upload_stage_acquired = False
         remove_task(upload_task_id)
         await finalize_user_progress(bot, update.from_user.id, progress_msg)
         err_str = str(e)

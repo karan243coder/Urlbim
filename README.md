@@ -89,9 +89,13 @@
 | Variable | Default | Purpose |
 |---|---|---|
 | `BIMBO_WORKERS` | 8 | Pyrogram workers |
-| `BIMBO_MAX_CONCURRENT_TASKS` | 2 | Simultaneous downloads |
+| `BIMBO_MAX_CONCURRENT_TASKS` | 2 | Legacy routes fallback limit |
+| `BIMBO_MAX_CONCURRENT_DOWNLOADS` | 2 | Global fair download-stage slots |
+| `BIMBO_MAX_CONCURRENT_UPLOADS` | 2 | Global Telegram upload-stage slots |
 | `YTDLP_CONCURRENT_FRAGMENTS` | 10 | Parallel fragments for generic HLS |
-| `XHAMSTER_CONCURRENT_FRAGMENTS` | 1 | Conservative xHamster HLS concurrency (prevents CDN 429) |
+| `XHAMSTER_CONCURRENT_FRAGMENTS` | 1 | Conservative fragments inside one xHamster HLS stream |
+| `XHAMSTER_MAX_CONCURRENT_DOWNLOADS` | 1 | One heavy xHamster stream per bot/IP; extra tasks queue safely |
+| `XHAMSTER_STALL_TIMEOUT` | 600 | Stop a frozen xHamster subprocess after 10 min without progress |
 | `XH_MIN_REQUEST_INTERVAL` | 1.25 | Seconds between xHamster metadata requests |
 | `XH_429_COOLDOWN` | 120 | Per-host cooldown after HTTP 429 |
 | `BIMBO_HTTP_PROXY` | — | Optional owner-authorized HTTP(S) proxy for shared-host IP limits |
