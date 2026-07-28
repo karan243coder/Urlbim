@@ -110,6 +110,11 @@ def extract_video_info(url: str) -> Optional[Dict]:
     try:
         url = _clean_url(url)
         host = (urlparse(url).hostname or "sxyprn.com")
+        # "www." hata do — site JS location.host use karta hai jo bina www hota
+        # hai; warna boo() galat base64 banata hai aur CDN 404/expire deta hai.
+        if host.startswith("www."):
+            host = host[4:]
+            url = url.replace("://www.", "://", 1)
 
         session = requests.Session()
         session.headers.update({
