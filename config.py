@@ -174,6 +174,10 @@ class Config(object):
     # Videos ko store karne wala channel (private). Bot yahan copy karta hai
     # taaki original delete hone par bhi stream chalti rahe. 0 => log channel use.
     BIMBO_STREAM_CHANNEL = _int("BIMBO_STREAM_CHANNEL", 0)
+    # Ek saath kitni streams chalein (low-RAM Koyeb pe kam rakho). Browser ek
+    # video ke liye 3-4 parallel range request bhejta hai; is limit se session
+    # choke nahi hota (Broken pipe fix). Zyada RAM ho to badha sakte ho.
+    BIMBO_STREAM_MAX_CONCURRENT = _int("BIMBO_STREAM_MAX_CONCURRENT", 2)
 
     # Anti-Spam: rate limit per user (seconds between downloads for free users)
     RATE_LIMIT_SECONDS = _int("RATE_LIMIT_SECONDS", 15)
