@@ -18,6 +18,7 @@ from database.users_chats_db import db
 from utils import is_admin, humanbytes
 from plugins.forcesub import handle_force_sub
 from plugins.premium_plans import track_referral_if_any
+from plugins.stickers import send_sticker
 
 import psutil
 
@@ -131,6 +132,9 @@ async def start_cmd(client: Client, m: Message):
                 return
             else:
                 return await m.reply_text("<b>⚠️ Link already used or expired.</b>")
+
+    # 🐱 LadyCat greeting sticker (welcome ke saath) — fail ho to ignore
+    await send_sticker(client, m.chat.id, mood="start", reply_to=m.id)
 
     # Custom start pic?
     start_text = Config.BIMBO_START_MSG or Translation.BIMBO_START_TEXT.format(m.from_user.mention)
