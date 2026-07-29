@@ -756,7 +756,44 @@ async def youtube_dl_call_back(bot, update, priority=100):
             common_ytdlp_args + hdr_args
             + ["--force-generic-extractor", "-o", download_directory, video_url]
         )
-    
+
+    # Universal Handler (koi bhi website — scrape se nikala hua direct URL)
+    elif response_json.get("_universal") and youtube_dl_format.startswith("uni-"):
+        uni_qualities = response_json.get("universal_qualities") or {}
+        uni_headers = response_json.get("universal_headers") or {}
+        try:
+            _h = int(youtube_dl_format.split("-", 1)[1])
+        except Exception:
+            _h = 720
+        video_url = uni_qualities.get(str(_h))
+        if not video_url:
+            avail = sorted((int(k) for k in uni_qualities.keys()))
+            pick = min(avail, key=lambda x: abs(x - _h)) if avail else None
+            video_url = uni_qualities.get(str(pick)) if pick else None
+
+        if not video_url:
+            await safe_edit(update.message, "ERROR: Video URL not found 🙁")
+            asyncio.create_task(clendir(tmp_directory_for_each_user))
+            return
+
+        hdr_args = []
+        ref = uni_headers.get("Referer")
+        if ref:
+            hdr_args += ["--add-header", f"Referer:{ref}"]
+
+        # HLS (.m3u8) hai to yt-dlp native (concurrent-fragments) se; warna
+        # generic extractor se direct file. Dono me yt-dlp hi use hota hai
+        # taaki redirect/format sahi handle ho.
+        is_hls = ".m3u8" in (video_url or "").lower()
+        if is_hls:
+            command_to_exec = common_ytdlp_args + hdr_args + [
+                "--force-generic-extractor", "-o", download_directory, video_url,
+            ]
+        else:
+            command_to_exec = common_ytdlp_args + hdr_args + [
+                "--force-generic-extractor", "-o", download_directory, video_url,
+            ]
+
     # Pornhub Handler
     elif response_json.get("_pornhub") and youtube_dl_format.startswith("ph-"):
         pornhub_qualities = response_json.get("pornhub_qualities") or {}
@@ -1043,10 +1080,12 @@ async def youtube_dl_call_back(bot, update, priority=100):
         # "Invalid range header"). Isliye sxyprn ke liye aria2c skip -> yt-dlp
         # ka native downloader use hoga jo redirect+range sahi handle karta hai.
         is_sxy_engine = bool(response_json.get("_sxyprn")) if isinstance(response_json, dict) else False
+        is_uni_engine = bool(response_json.get("_universal")) if isinstance(response_json, dict) else False
         # For direct CDN links (like pvvstream pro etc.), add Referer to bypass hotlink
-        # IMPORTANT: skip for custom engines (xh, ep, sxyprn) — their CDN URLs have
-        # signed tokens / redirects that break with aria2 external downloader.
-        if not is_fragment_stream and not is_xh_engine and not is_ep_engine and not is_sxy_engine:
+        # IMPORTANT: skip for custom engines (xh, ep, sxyprn, universal) — their CDN
+        # URLs have signed tokens / redirects that break with aria2 external downloader.
+        if (not is_fragment_stream and not is_xh_engine and not is_ep_engine
+                and not is_sxy_engine and not is_uni_engine):
             command_to_exec.extend([
                 "--downloader", "aria2c",
                 "--downloader-args", (
