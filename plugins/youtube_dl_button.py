@@ -781,15 +781,45 @@ async def youtube_dl_call_back(bot, update, priority=100):
         if ref:
             hdr_args += ["--add-header", f"Referer:{ref}"]
 
-        # HLS (.m3u8) hai to yt-dlp native (concurrent-fragments) se; warna
-        # generic extractor se direct file. Dono me yt-dlp hi use hota hai
-        # taaki redirect/format sahi handle ho.
-        is_hls = ".m3u8" in (video_url or "").lower()
+        low = (video_url or "").lower()
+        is_hls = ".m3u8" in low
+
         if is_hls:
+            # HLS/m3u8: yt-dlp ka apna HLS downloader use karo (concurrent
+            # fragments). --force-generic-extractor yahan MAT lagao warna
+            # sirf ek chhota fragment (0.01 sec) aata hai. hls-use-mpegts +
+            # native/ffmpeg se poori playlist download hoti hai.
             command_to_exec = common_ytdlp_args + hdr_args + [
-                "--force-generic-extractor", "-o", download_directory, video_url,
+                "--hls-use-mpegts",
+                "--hls-prefer-native",
+                "-N", "8",  # 8 concurrent fragments
+                "-o", download_directory, video_url,
             ]
         else:
+            # Direct file: redirect resolve karo (warna yt-dlp redirect ke baad
+            # file ko galat "fmp4" samajh ke 30 bytes/0.01s download karta hai —
+            # bilkul sxyprn wala issue). Fresh final URL yt-dlp ko do.
+            try:
+                import requests as _rq
+                _ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                _hh = {"User-Agent": _ua}
+                if ref:
+                    _hh["Referer"] = ref
+                _rr = await asyncio.to_thread(
+                    _rq.get, video_url, headers=_hh, timeout=30,
+                    allow_redirects=True, stream=True, verify=False,
+                )
+                _resolved = _rr.url or video_url
+                try:
+                    _rr.close()
+                except Exception:
+                    pass
+                if _resolved and _resolved != video_url:
+                    logger.info("universal: resolved redirect -> %s", _resolved[:80])
+                    video_url = _resolved
+            except Exception as e:
+                logger.warning("universal redirect resolve failed: %s", e)
+
             command_to_exec = common_ytdlp_args + hdr_args + [
                 "--force-generic-extractor", "-o", download_directory, video_url,
             ]
