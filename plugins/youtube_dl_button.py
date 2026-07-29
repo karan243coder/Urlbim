@@ -2050,7 +2050,14 @@ async def youtube_dl_call_back(bot, update, priority=100):
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
         )
-        
+
+        # 🐱 LadyCat success sticker (thumbs up / celebration) — fail ho to ignore
+        try:
+            from plugins.stickers import send_sticker as _send_sticker
+            await _send_sticker(bot, update.message.chat.id, mood="success")
+        except Exception:
+            pass
+
         # Auto-delete success message after 15 seconds
         async def delete_success_msg():
             await asyncio.sleep(15)
