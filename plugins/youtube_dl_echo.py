@@ -25,6 +25,10 @@ from plugins.xhamster_engine import is_xhamster as _xh_is, extract as xh_extract
 from plugins.eporner_engine import is_eporner as _ep_is, extract_video as ep_extract
 from plugins.terabox_engine import is_terabox as _tb_is, extract as tb_extract
 from plugins.sxyprn_engine import is_sxyprn as _sxy_is, extract_video_info as sxyprn_extract
+from plugins.universal_engine import (
+    is_universal_candidate as _uni_ok,
+    extract_video_info as universal_extract,
+)
 from plugins.pornhub_engine import is_pornhub as _ph_is, extract_video_info as pornhub_extract
 from plugins.xvideos_engine import is_xvideos as _xv_is, extract_video_info as xvideos_extract
 from plugins.redtube_engine import is_redtube as _rt_is, extract_video_info as redtube_extract
@@ -569,6 +573,28 @@ async def echo(bot, update):
 
     url, file_name, youtube_dl_username, youtube_dl_password = extract_url_parts(update.text, update.entities)
     original_name = file_name if file_name else "Not Set"
+
+    # ============================================================
+    #  AGGREGATOR RESOLVE (qorno.com jaisi redirect sites)
+    #  qorno khud video host nahi karti — /out/?l=<base64> asli site
+    #  (eporner/xhamster/xozilla/etc.) pe le jaata hai. Yahan asli URL
+    #  nikaal lo taaki niche ke dedicated engines / universal use kar sakein.
+    # ============================================================
+    try:
+        import requests as _rq
+        from plugins.universal_engine import _resolve_aggregator as _resolve_agg
+        _pr = urlparse(url)
+        if any(seg in (_pr.path.lower() + "?" + (_pr.query or "").lower())
+               for seg in ("/out", "/go", "/away", "/redirect", "l=", "url=")):
+            _sess = _rq.Session()
+            _sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            _resolved = await asyncio.to_thread(_resolve_agg, url, _sess)
+            if _resolved and _resolved != url:
+                logger.info("aggregator resolved: %s -> %s", url[:60], _resolved[:80])
+                url = _resolved
+    except Exception as _e:
+        logger.debug("aggregator resolve skip: %s", _e)
 
     await send_log(
         bot,
@@ -1248,6 +1274,46 @@ async def echo(bot, update):
         except Exception as e:
             logger.error(f"Bang engine error: {e}")
 
+    # ============================================================
+    #  UNIVERSAL Extractor (koi bhi website) — SCRAPE-FIRST fallback
+    #  Kisi dedicated engine se match nahi hua -> page se seedha
+    #  video (.mp4/.m3u8/og:video/iframe) nikaalne ki koshish karo.
+    #  Mile to generic keyboard dikhao; na mile to niche yt-dlp try hoga.
+    # ============================================================
+    if _uni_ok(url):
+        try:
+            uni_info = await asyncio.to_thread(universal_extract, url)
+            if uni_info and uni_info.get("qualities"):
+                logger.info("universal engine OK: %s", url)
+                uni_json = {
+                    "title": uni_info.get("title") or "Video",
+                    "fulltitle": uni_info.get("title") or "Video",
+                    "duration": uni_info.get("duration"),
+                    "_universal": True,
+                    "universal_qualities": {str(q["height"]): q["url"] for q in uni_info["qualities"]},
+                    "universal_headers": uni_info.get("headers") or {},
+                }
+                os.makedirs(Config.BIMBO_DOWNLOAD_LOCATION, exist_ok=True)
+                task_id = generate_task_id(update.from_user.id)
+                save_ytdl_json_path = os.path.join(
+                    Config.BIMBO_DOWNLOAD_LOCATION, f"{update.from_user.id}_{task_id}.json")
+                with open(save_ytdl_json_path, "w", encoding="utf8") as outfile:
+                    json.dump(uni_json, outfile, ensure_ascii=False)
+
+                reply_markup = build_generic_engine_keyboard(uni_info, task_id, "uni", "Video")
+                await imog.delete(True)
+                await bot.send_message(
+                    chat_id=update.chat.id,
+                    text=(f"<b>🎯 Video detected</b>\n\n<b>📹 Title:</b> "
+                          f"{escape_html((uni_info.get('title') or 'Video')[:100])}\n\nChoose quality:"),
+                    reply_markup=reply_markup,
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_to_message_id=update.id,
+                )
+                return
+        except Exception as e:
+            logger.error(f"Universal engine error: {e}")
+
     command_to_exec = [
         "yt-dlp",
         "--no-warnings",
@@ -1331,7 +1397,9 @@ async def echo(bot, update):
                 "• Twitter\n"
                 "• Facebook\n"
                 "• Aur 1000+ aur websites\n\n"
-                "Kripya valid URL bhejein."
+                "ℹ️ Universal extractor bhi try karta hai (koi bhi site), par is\n"
+                "link pe video nahi mili — shayad login/DRM/heavy-JS protected hai.\n\n"
+                "Kripya valid direct video link ya doosri site try karein."
             )
         elif "Private video" in e_response or "deleted" in e_response:
             error_message = (
