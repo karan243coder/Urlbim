@@ -552,6 +552,11 @@ def extract_url_parts(text, entities):
 
 @BimboBot.on_message(filters.private & ~filters.via_bot & filters.regex(pattern=".*http.*"))
 async def echo(bot, update):
+    # Skip torrent/magnet links — handled by torrent_download.py
+    _text = (update.text or "").strip()
+    if _text.startswith("magnet:") or _text.lower().endswith(".torrent"):
+        return  # torrent_download.py handles these
+
     if not await check_verification(bot, update.from_user.id) and Config.BIMBO is True:
         verify_url = await get_token(bot, update.from_user.id, f"https://telegram.me/{Config.BIMBO_BOT_USERNAME}?start=")
         await update.reply_text(
