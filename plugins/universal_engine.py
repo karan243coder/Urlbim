@@ -132,11 +132,26 @@ def _quality_from_url(u: str, default: int = 720) -> int:
     return default
 
 
+# Preview/thumbnail clips — inhe SKIP karo warna 0.01 sec ka chhota video aata hai
+_PREVIEW_HINTS = (
+    "vidthumb", "thumb", "preview", "trailer", "teaser", "sample",
+    "/prev/", "-prev", "promo", "sprite", "scrubbing", "poster",
+    "/small.", "-small", "/tiny", "hover", "webp",
+)
+
+
 def _looks_like_video(u: str) -> bool:
     if not u:
         return False
-    low = u.lower().split("?")[0]
-    return any(low.endswith(e) for e in _VIDEO_EXTS) or ".m3u8" in u.lower() or ".mp4" in u.lower()
+    ul = u.lower()
+    low = ul.split("?")[0]
+    is_media = any(low.endswith(e) for e in _VIDEO_EXTS) or ".m3u8" in ul or ".mp4" in ul
+    if not is_media:
+        return False
+    # Preview/thumbnail clip? -> reject (ye 1-2 sec ke chhote clips hote hain)
+    if any(hint in ul for hint in _PREVIEW_HINTS):
+        return False
+    return True
 
 
 def _fetch_impersonate(url: str, referer: str = None) -> Optional[str]:
