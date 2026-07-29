@@ -31,6 +31,13 @@ from typing import Optional, Dict, List
 import requests
 from bs4 import BeautifulSoup
 
+# verify=False ki wajah se aane wali "InsecureRequestWarning" log spam band karo
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -424,6 +431,16 @@ def extract_video_info(url: str, _depth: int = 0, _referer: str = None) -> Optio
             r.encoding or "utf-8", errors="ignore")
         base = r.url
         r.close()
+
+        # ---- KVS player detect (freeporn8/sortporn/pornwhite/txxx/hclips/etc.) ----
+        # In sites me HTML me jo video_url hota hai wo SCRAMBLED/decoy hota hai
+        # (aksar ek GIF/37KB deta hai). Asli URL license_code se decode hota hai
+        # jo yt-dlp ka KVS extractor achhe se karta hai. Isliye KVS page pe
+        # universal scrape SKIP karo -> flow yt-dlp pe fall-through ho jayega.
+        if _depth == 0 and ("license_code" in html or "kt_player" in html
+                            or "kvs_player" in html or "flashvars" in html.lower()):
+            logger.info("universal: KVS player detected -> yt-dlp ko dena behtar, skip")
+            return None
 
         # 1) scrape this page
         vids = _collect_from_html(html, base)
