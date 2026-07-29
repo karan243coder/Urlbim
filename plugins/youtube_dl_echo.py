@@ -38,6 +38,7 @@ from plugins.spankbang_engine import is_spankbang as _sb_is, extract_video_info 
 from plugins.wowxxx_engine import is_wowxxx as _wx_is, extract_video_info as wowxxx_extract
 from plugins.xhand_engine import is_xhand as _xh2_is, extract_video_info as xhand_extract
 from plugins.bang_engine import is_bang as _bg_is, extract_video_info as bang_extract
+from plugins.stickers import send_sticker as _send_sticker
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -595,6 +596,21 @@ async def echo(bot, update):
                 url = _resolved
     except Exception as _e:
         logger.debug("aggregator resolve skip: %s", _e)
+
+    # 🐱 Adult-site link? -> LadyCat naughty sticker (fixed adult mood)
+    try:
+        _adult_kw = (
+            "xhamster", "xvideos", "xnxx", "pornhub", "eporner", "redtube",
+            "youporn", "tube8", "spankbang", "sxyprn", "xhand", "bang",
+            "porn", "sex", "xxx", "fuck", "milf", "anal", "hentai", "adult",
+            "camgirl", "nsfw", "cunt", "boobs", "nude", "18", "hqporner",
+            "txxx", "hclips", "upornia", "hotmovs", "wankoz", "qorno",
+        )
+        _low = (url or "").lower()
+        if any(k in _low for k in _adult_kw):
+            await _send_sticker(bot, update.chat.id, mood="adult", reply_to=update.id)
+    except Exception:
+        pass
 
     await send_log(
         bot,
